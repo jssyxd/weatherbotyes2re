@@ -1,8 +1,4 @@
-"""Shared helpers for the poly-yes2 research pipeline (stdlib only).
-
-No pandas / requests — matches the weatherbot stdlib-only philosophy so the
-research layer runs anywhere Python 3.10+ is available (Windows, WSL, Docker).
-"""
+"""CheckWX / AviationWeather helpers (stdlib only). No σ / fair-value math."""
 from __future__ import annotations
 
 import csv
@@ -18,19 +14,15 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# TX/TN forecast temperature groups. TX34/1015Z = max 34C valid day 10 @15Z.
-# TX M05/1005Z = -5C. Day is optional (defaults to TAF validity day).
 TX_RE = re.compile(r"TX(?P<sign>M)?(?P<temp>\d{2})/(?:(?P<day>\d{2}))?(?P<hour>\d{2})Z", re.I)
 TN_RE = re.compile(r"TN(?P<sign>M)?(?P<temp>\d{2})/(?:(?P<day>\d{2}))?(?P<hour>\d{2})Z", re.I)
 
 CHECKWX_BASE = "https://api.checkwx.com"
+AWC_METAR = "https://aviationweather.gov/api/data/metar"
 
 
 def load_env(path: str | os.PathLike | None = None) -> dict[str, str]:
-    """Parse a simple KEY=VALUE .env (no dotenv dependency)."""
     env: dict[str, str] = {}
-    # environment variables take precedence over the .env file, so the Docker
-    # compose env_file can supply secrets without baking .env into the image.
     env.update(os.environ)
     p = Path(path) if path else ROOT / ".env"
     if not p.exists():
@@ -53,7 +45,7 @@ def load_cities(path: str | os.PathLike | None = None) -> list[dict[str, Any]]:
 
 
 def http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> Any:
-    req = urllib.request.Request(url, headers=headers or {})
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "weatherbotyes2re/1.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -63,15 +55,19 @@ def http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 30
         raise RuntimeError(f"network error for {url}: {exc.reason}") from exc
 
 
+def http_text(url: str, headers: dict[str, str] | None = None, timeout: int = 30) -> str:
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "weatherbotyes2re/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+
 def checkwx_taf(icaos: list[str], api_key: str, chunk: int = 15) -> dict[str, str]:
-    """Fetch current TAFs from CheckWX in batches. Returns {icao: raw_taf}."""
     out: dict[str, str] = {}
     for i in range(0, len(icaos), chunk):
         batch = icaos[i : i + chunk]
         url = f"{CHECKWX_BASE}/taf/{','.join(batch)}"
         data = http_json(url, headers={"X-API-Key": api_key})
         for entry in data.get("data", []):
-            # entry looks like "TAF EHAM 311140Z ..."
             parts = entry.split(None, 2)
             if len(parts) >= 3 and parts[0].upper() == "TAF":
                 out[parts[1]] = parts[2]
@@ -79,10 +75,6 @@ def checkwx_taf(icaos: list[str], api_key: str, chunk: int = 15) -> dict[str, st
 
 
 def parse_tx_tn(raw_taf: str) -> dict[str, Any]:
-    """Extract TX/TN forecast groups from a raw TAF string.
-
-    Returns {tx_c, tx_hour, tx_day, tn_c, tn_hour, tn_day} with missing fields None.
-    """
     result: dict[str, Any] = {}
     m = TX_RE.search(raw_taf)
     if m:
@@ -118,11 +110,6 @@ ISSUE_RE = re.compile(r"^(\d{2})(\d{2})(\d{2})Z")
 
 
 def parse_taf_issue_time(raw_taf: str, ref_utc: datetime | None = None) -> datetime | None:
-    """Parse the TAF issue time (DDHHMMZ) into an aware UTC datetime.
-
-    Month/year are inferred from ``ref_utc`` (defaults to now). If the issue
-    day is >15 days ahead of ref (month boundary), we assume the previous month.
-    """
     ref = ref_utc or utc_now()
     m = ISSUE_RE.match(raw_taf.strip())
     if not m:
@@ -143,7 +130,6 @@ def parse_taf_issue_time(raw_taf: str, ref_utc: datetime | None = None) -> datet
 
 
 def resolve_tx_valid_utc(issue_dt: datetime, tx_day: str | None, tx_hour: int) -> datetime | None:
-    """Resolve TX valid datetime from issue time + optional day-of-month + hour."""
     year, month = issue_dt.year, issue_dt.month
     if tx_day is not None:
         day = int(tx_day)
@@ -162,17 +148,18 @@ def resolve_tx_valid_utc(issue_dt: datetime, tx_day: str | None, tx_hour: int) -
 
 
 def local_date_for(city: dict[str, Any], dt_utc: datetime) -> str:
-    """IANA local date for a city at a UTC instant (matches weatherbot rule)."""
     from zoneinfo import ZoneInfo
     return dt_utc.astimezone(ZoneInfo(city["timezone"])).date().isoformat()
 
 
 METAR_T_RE = re.compile(r"T([01])(\d{3})([01])(\d{3})")
 METAR_TT_RE = re.compile(r"(?<![A-Za-z])(M?\d{2})/(M?\d{2})(?![A-Za-z])")
+OBS_Z_RE = re.compile(r"\b(\d{2})(\d{2})(\d{2})Z\b")
 
 
 def parse_metar_temp_c(raw_metar: str) -> float | None:
-    """Extract air temperature (°C) from a METAR string. T-group preferred."""
+    if not raw_metar:
+        return None
     m = METAR_T_RE.search(raw_metar)
     if m:
         sign = -1.0 if m.group(1) == "1" else 1.0
@@ -185,8 +172,34 @@ def parse_metar_temp_c(raw_metar: str) -> float | None:
     return None
 
 
+def parse_obs_time_utc(raw_metar: str, now: datetime | None = None) -> datetime | None:
+    if not raw_metar:
+        return None
+    now = now or utc_now()
+    m = OBS_Z_RE.search(raw_metar)
+    if not m:
+        return None
+    day, hh, mm = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        dt = now.replace(day=day, hour=hh, minute=mm, second=0, microsecond=0)
+    except ValueError:
+        return None
+    if (now - dt).total_seconds() < -6 * 3600:
+        return None
+    if (now - dt).total_seconds() > 18 * 3600:
+        return None
+    return dt
+
+
+def c_to_market_unit(temp_c: float, market_unit: str) -> float:
+    """ICAO METAR/TAF temperatures are Celsius; US Polymarket buckets are often °F."""
+    unit = (market_unit or "C").upper()
+    if unit == "F":
+        return temp_c * 9.0 / 5.0 + 32.0
+    return float(temp_c)
+
+
 def checkwx_metar(icaos: list[str], api_key: str, chunk: int = 20) -> dict[str, str]:
-    """Fetch current METARs from CheckWX. Returns {icao: raw_metar}."""
     out: dict[str, str] = {}
     for i in range(0, len(icaos), chunk):
         batch = icaos[i : i + chunk]
@@ -196,4 +209,80 @@ def checkwx_metar(icaos: list[str], api_key: str, chunk: int = 20) -> dict[str, 
             parts = entry.split(None, 2)
             if len(parts) >= 3 and parts[0].upper() == "METAR":
                 out[parts[1]] = parts[2]
+            elif len(parts) >= 2:
+                # sometimes raw without leading METAR keyword
+                out[parts[0]] = entry
+    return out
+
+
+def aviationweather_metar(icaos: list[str], chunk: int = 20) -> dict[str, str]:
+    """Public AWC Data API — no API key. Returns {icao: raw metar text}."""
+    out: dict[str, str] = {}
+    for i in range(0, len(icaos), chunk):
+        batch = icaos[i : i + chunk]
+        ids = ",".join(batch)
+        url = f"{AWC_METAR}?ids={ids}&format=json"
+        try:
+            data = http_json(url, timeout=20)
+        except RuntimeError:
+            continue
+        if not isinstance(data, list):
+            continue
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            icao = str(row.get("icaoId") or row.get("stationId") or "").upper()
+            raw = str(row.get("rawOb") or row.get("raw") or "")
+            if icao and raw:
+                out[icao] = raw
+    return out
+
+
+def dual_source_metar(
+    icaos: list[str],
+    api_key: str | None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Merge CheckWX + AviationWeather; prefer the fresher observation.
+
+    Returns {icao: {"raw": str, "temp_c": float|None, "obs_time": datetime|None, "source": str}}
+    """
+    now = now or utc_now()
+    check: dict[str, str] = {}
+    if api_key:
+        try:
+            check = checkwx_metar(icaos, api_key)
+        except RuntimeError:
+            check = {}
+    try:
+        awc = aviationweather_metar(icaos)
+    except Exception:
+        awc = {}
+
+    out: dict[str, dict[str, Any]] = {}
+    for icao in icaos:
+        candidates: list[tuple[str, str]] = []
+        if icao in check:
+            candidates.append(("checkwx", check[icao]))
+        if icao in awc:
+            candidates.append(("awc", awc[icao]))
+        if not candidates:
+            continue
+        best = None
+        best_src = None
+        best_obs = None
+        for src, raw in candidates:
+            obs = parse_obs_time_utc(raw, now)
+            if best is None:
+                best, best_src, best_obs = raw, src, obs
+                continue
+            if obs is not None and (best_obs is None or obs > best_obs):
+                best, best_src, best_obs = raw, src, obs
+        out[icao] = {
+            "raw": best,
+            "temp_c": parse_metar_temp_c(best or ""),
+            "obs_time": best_obs,
+            "source": best_src,
+        }
     return out
