@@ -1,7 +1,6 @@
 """Public Polymarket Gamma adapter for temperature-market rule discovery.
 
-The adapter reads public event metadata only. It never authenticates, signs, reads a
-wallet, or sends an order. Parsed rules are inputs to the local paper signal engine.
+Public metadata only. No auth, no orders, no σ / fair-value pricing.
 """
 from __future__ import annotations
 
@@ -30,24 +29,23 @@ def event_slug(market_city_slug: str, local_date: str, direction: str) -> str:
 
 
 def _fetch_json(url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={"User-Agent": "weatherbot-market-adapter/1.1 (+https://github.com/jssyxd/weatherbot)"})
+    request = urllib.request.Request(url, headers={"User-Agent": "weatherbotyes2re/1.0"})
     try:
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             payload = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return {}
-        raise RuntimeError(f"Gamma 请求失败（HTTP {exc.code}）") from exc
+        raise RuntimeError(f"Gamma HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Gamma 网络请求失败: {exc.reason}") from exc
+        raise RuntimeError(f"Gamma network: {exc.reason}") from exc
     parsed = json.loads(payload)
     if not isinstance(parsed, dict):
-        raise RuntimeError("Gamma 事件返回格式异常")
+        raise RuntimeError("Gamma event shape invalid")
     return parsed
 
 
 def parse_bucket(outcome_text: str) -> tuple[float | None, float | None, str] | None:
-    """Parse contract question interval as a half-open numeric bucket [lo, hi)."""
     for pattern, kind in ((RANGE_RE, "range"), (EXACT_RE, "exact"), (BELOW_RE, "below"), (ABOVE_RE, "above")):
         match = pattern.match(outcome_text)
         if not match:
@@ -74,7 +72,6 @@ def _bucket_sort_key(bucket: dict[str, Any]) -> tuple[float, float]:
 
 
 def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: str, direction: str) -> list[dict[str, Any]]:
-    """Parse one active event into one rule with all its selectable temperature buckets."""
     expected_slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
     if event.get("slug") != expected_slug:
         return []
@@ -126,16 +123,12 @@ def parse_event_rules(event: dict[str, Any], city: dict[str, Any], local_date: s
     }]
 
 
-def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[str, list[str]], timeout_seconds: float = 5.0, total_deadline_seconds: float = 180.0) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Fetch public Gamma metadata with bounded concurrency and total deadline.
-
-    ``local_dates`` maps each ICAO to one or more IANA-local market dates. The
-    tree12 strategy lays out NO positions more than 24 hours before a local day,
-    so callers should request today plus the next couple of days. A failed
-    remote market-data endpoint must not prevent weather observation or warm-up
-    progress; missing pairs are recorded as explicit failures so callers remain
-    fail-closed instead of treating partial market rules as complete.
-    """
+def refresh_market_rules(
+    cities: dict[str, dict[str, Any]],
+    local_dates: dict[str, list[str]],
+    timeout_seconds: float = 5.0,
+    total_deadline_seconds: float = 180.0,
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
     rules: list[dict[str, Any]] = []
     failures: dict[str, str] = {}
     tasks: list[tuple[dict[str, Any], str, str]] = []
@@ -159,9 +152,7 @@ def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[st
             if not parsed:
                 return key, "no_trade_ready_parsed_rules", []
             return key, None, parsed
-        except (RuntimeError, ValueError, KeyError, json.JSONDecodeError, TimeoutError) as exc:
-            return key, f"market_discovery_failed:{type(exc).__name__}", []
-        except Exception as exc:  # noqa: BLE001 - fail-closed per remote pair
+        except Exception as exc:  # noqa: BLE001
             return key, f"market_discovery_failed:{type(exc).__name__}", []
 
     started = time.monotonic()
@@ -184,13 +175,13 @@ def refresh_market_rules(cities: dict[str, dict[str, Any]], local_dates: dict[st
     return rules, failures
 
 
-def fetch_market_resolution(city: dict[str, Any], local_date: str, direction: str, bucket_id: Any) -> str | None:
-    """Return the resolved outcome ("YES"/"NO") for a bucket's market, or None if unresolved.
+def fetch_market_resolution(
+    city: dict[str, Any], local_date: str, direction: str, bucket_id: Any
+) -> tuple[str | None, Any] | None:
+    """Return (outcome, resolution_source) or None if unresolved / not found.
 
-    Reads Gamma's ``outcomePrices`` (terminal prices ["1","0"] or ["0","1"]) — the
-    market's own settlement, which is authoritative and timely (no ERA5 lag, no
-    incomplete METAR-poll accumulation). Returns None when the market is still open
-    or the outcome is not terminal yet.
+    outcome is "YES" or "NO" when terminal; may be None with a source if prices
+    are present but not terminal yet.
     """
     slug = event_slug(str(city.get("market_city_slug") or city["city_id"]), local_date, direction)
     try:
@@ -212,8 +203,8 @@ def fetch_market_resolution(city: dict[str, Any], local_date: str, direction: st
         if not isinstance(prices, list) or len(prices) < 2:
             return None
         if prices[0] == "1" and prices[1] == "0":
-            return "YES", source
+            return ("YES", source)
         if prices[0] == "0" and prices[1] == "1":
-            return "NO", source
-        return None, source
+            return ("NO", source)
+        return (None, source)
     return None
