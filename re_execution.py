@@ -129,6 +129,8 @@ def size_legs(fire_event, budget_usdc):
     return out
 
 def paper_match_fak(book, limit, shares):
+    if book is None:
+        return {"filled_shares": ZERO, "avg_price": None, "cost": ZERO, "unfilled": shares}
     asks = book.setdefault("asks", [])
     filled = ZERO
     cost = ZERO

@@ -1,5 +1,14 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-02 — Merge poly-yes2 paper infra; drop σ
+
+- Paper runtime now lives here: `reversal_runner.py` + Gamma/CLOB/CheckWX/cities/capital/settlement.
+- ARM stations fast-poll METAR/books only (idle still samples the full universe).
+- `consensus_min_samples` aligned to **20** (was 8 in the poly-yes2 copy).
+- `paper_match_fak` guards `book is None`.
+- **Not merged:** poly-yes2 `paper_runner` TAF/σ arms (BUY-YES, fade-NO, dead-NO grid). Retired.
+- Canonical repo is this one. `poly-yes2` (main / treeA / treeB) can be deleted.
+
 ## 2026-09-02 — Consensus filter + stricter break (HFT path)
 
 ### Strategy
