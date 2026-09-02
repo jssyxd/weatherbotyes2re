@@ -1,4 +1,12 @@
-"""Reversal fill module: capped FAK ladder + paper L2 matcher."""
+"""Reversal fill module: capped FAK ladder + paper L2 matcher.
+
+Design goals for speed vs price:
+- Books and token metadata must already be in memory before FIRE (ARM prefetch).
+- Parallel legs; each leg independent abort.
+- Hard cap: never walk through market after scramble.
+- Ladder: t=0 FAK@min(ask,cap) -> t=1.5s +1tick if still <=cap -> t=4s @cap -> t=8s abort.
+- Dedup key is owned by strategy layer (city|date|direction).
+"""
 from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -55,20 +63,56 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
         return {"status": "abort_timeout", "leg": leg.get("leg"), "unfilled": str(target_shares)}
     if ask is None:
         return {"status": "no_book", "leg": leg.get("leg")}
-    extra = 1 if elapsed_ms >= LADDER_MS[1] else 0
+    # Ladder: 0ms flat, 1500ms +1 tick, 4000ms still at +1 (cap-bounded)
+    extra = 0
+    if elapsed_ms >= LADDER_MS[1]:
+        extra = 1
+    if elapsed_ms >= LADDER_MS[2]:
+        extra = 1  # still only +1 tick; never open-ended chase
     limit = cap_price(ask, cap, tick, extra_ticks=extra)
     if limit is None:
-        return {"status": "abort_above_cap", "leg": leg.get("leg"), "best_ask": str(ask) if ask is not None else None, "cap": str(cap)}
-    return {"status": "send_fak", "leg": leg.get("leg"), "token_id": token, "side": leg.get("side", "BUY"), "outcome": leg.get("outcome"), "order_type": "FAK", "limit_price": str(limit), "shares": str(target_shares), "best_ask": str(ask), "cap": str(cap), "elapsed_ms": elapsed_ms, "at_utc": iso_utc(now_utc)}
+        return {
+            "status": "abort_above_cap",
+            "leg": leg.get("leg"),
+            "best_ask": str(ask) if ask is not None else None,
+            "cap": str(cap),
+            "note": "scramble_already_repriced_stand_down",
+        }
+    return {
+        "status": "send_fak",
+        "leg": leg.get("leg"),
+        "token_id": token,
+        "side": leg.get("side", "BUY"),
+        "outcome": leg.get("outcome"),
+        "order_type": "FAK",
+        "limit_price": str(limit),
+        "shares": str(target_shares),
+        "best_ask": str(ask),
+        "cap": str(cap),
+        "extra_ticks": extra,
+        "elapsed_ms": elapsed_ms,
+        "at_utc": iso_utc(now_utc),
+    }
 
-def plan_fire_cycle(fire_event, books_by_token, remaining_by_leg, now_utc, elapsed_ms, budget_ms=FIRE_BUDGET_MS):
+def plan_fire_cycle(fire_event, books_by_token, remaining_by_leg, now_utc, elapsed_ms, budget_ms=None):
+    if budget_ms is None:
+        budget_ms = int(fire_event.get("fire_budget_ms") or FIRE_BUDGET_MS)
     actions = []
     for leg in fire_event.get("legs") or []:
         name = str(leg.get("leg"))
         left = remaining_by_leg.get(name, ZERO)
         if left <= ZERO:
             continue
-        actions.append(plan_leg_attempts(leg, books_by_token.get(str(leg.get("token_id") or "")), left, now_utc, elapsed_ms, budget_ms=budget_ms))
+        actions.append(
+            plan_leg_attempts(
+                leg,
+                books_by_token.get(str(leg.get("token_id") or "")),
+                left,
+                now_utc,
+                elapsed_ms,
+                budget_ms=budget_ms,
+            )
+        )
     return actions
 
 def shares_from_notional(notional, cap):

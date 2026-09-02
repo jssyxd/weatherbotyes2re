@@ -1,142 +1,89 @@
 # weatherbotyes2re
 
-METAR vs TAF **reversal** strategy.
+METAR vs TAF **reversal** strategy — speed edge on consensus break.
 
-When live METAR proves the current TAF extreme is wrong, the market must reprice the broken bucket and the new bucket. Edge is **not** forecasting better than TAF. Edge is **seeing the break a few seconds earlier and filling before the scramble finishes**.
+When live METAR proves the current reference extreme wrong, the market must reprice the broken bucket and the new bucket. Edge is **not** forecasting better than TAF. Edge is **seeing the break a few seconds earlier and filling before the scramble finishes**.
 
 Default: paper / observe.
 
-## Trade (high example)
+## Core rules (2026-09-02)
 
-TAF TX says 31. METAR running max prints 32 and enters the next bucket.
+### 1. Break confirmation
+- High: `running_max`; Low: `running_min`.
+- Reference extreme: **TAF TX/TN** if present; else **market 1–2h rank-1 YES TWAP** bucket mid.
+- Jump allowed for YES leg: **exactly 1 bucket**. Jump ≥ 2 → NO-only on broken bucket.
+- Must be a **new `obs_time`** (not a duplicate push).
+- Observation age ≤ `require_fresh_obs_seconds` (default 180).
 
-| Leg | Action | Why |
-|-----|--------|-----|
-| Broken TAF bucket | **BUY NO** | That YES is now almost dead if we assume 1-bucket error |
-| New METAR bucket | **BUY YES** | This is the new candidate extreme |
+### 2. Long-horizon consensus filter (required by default)
+Broken bucket must have been **rank-1** on YES TWAP over `consensus_window_seconds` (default 7200):
+- Filters “market already rotated” false breaks.
+- Needs continuous book sampling *before* the break (`ConsensusTracker.record_books`).
 
-Low is symmetric: METAR running min breaks below TAF TN.
+### 3. Time window
+- High: local hour ≥ 14 (best 15–17).
+- Low: local hour ≤ 10.
 
-Hard assumption: TAF error is usually **at most one bucket**. We only trade the broken bucket and the immediately adjacent new bucket. If METAR jumps two buckets, **do not** buy YES two steps away.
+### 4. Legs
+| Leg | Role | Default cap | Notional |
+|-----|------|-------------|----------|
+| BUY NO broken | Main (near-deterministic) | 0.65 | 75% |
+| BUY YES new | Optional | 0.48 | 25% |
 
-## What the original idea misses
+### 5. Execution (HFT-shaped)
+- Idle poll normal; **ARM** (distance to ref ≤ `arm_c`) → fast poll 5–10s on that ICAO only.
+- Prefetch token ids + keep **CLOB WS books** in memory.
+- FIRE: parallel FAK, budget ~8s, ladder +0/+1 tick, **abort if ask > cap** (no chase).
+- One fire per `city|date|direction`.
 
-1. **Broken-bucket NO is the cleaner leg.** Once the high has already printed above the TAF bucket, that bucket cannot be the daily high. YES on the *new* bucket can still be wrong if temperature keeps rising.
-2. **One print is not a break.** A single spike / bad decode / runway vs official site mismatch will fake you out. Require: valid METAR, observation time fresh, and preferably 2 prints or 1 print + TAF already close.
-3. **METAR cadence is the real bottleneck.** Many airports update every 20–60 minutes. If you poll every 120s like tree12, you are not early — you are in the same wave as every other bot. Speed lives in the *armed* state, not in the global scan.
-4. **Everyone else is also reversing.** After the break, YES ask on the new bucket and NO ask on the old bucket gap up. Uncapped FAK is how you donate edge.
-5. **Two-bucket jump kills the YES leg.** If it goes TAF 31 → 33 and buckets are 1°C, buying YES at 32 loses. Size the YES leg smaller than the NO leg.
-6. **Official settlement source may not be your METAR.** Confirm city→station mapping. If Polymarket uses a different site, this strategy is noise.
-7. **Do not keep adding during the scramble.** One fire per city/date/direction.
-8. **Late-day vs early-day.** A break at 11:00 local (high) is weak. A break at 15:00–18:00 is much more informative.
+## Trade example (high)
 
-## Recommended payoff structure
+TAF / consensus TX bucket = 31. METAR running max prints 32.
 
-Default size split:
+| Leg | Action |
+|-----|--------|
+| Broken 31 | **BUY NO** |
+| New 32 | **BUY YES** (if jump==1 and ask ≤ cap) |
 
-- **70% notional on NO** of the broken bucket (higher confidence)
-- **30% notional on YES** of the new bucket (optional, can disable)
-- Caps: buy NO only if ask ≤ `0.62`, buy YES only if ask ≤ `0.48`
-- If either cap is blown, skip that leg. Taking only the NO leg is still a valid trade.
+## Data path recommendation (across your repos)
 
-After fill:
+| Need | Prefer | Source in your stack |
+|------|--------|----------------------|
+| Live top-of-book / depth | **CLOB Market WebSocket** | `poly-yes2/websocket_market_data.py` + `local_order_book.py` |
+| Event + bucket map + token ids | **Gamma REST** (refresh ≤ 15–30 min) | `market_adapter.py` |
+| Snapshot / fee / fallback | CLOB REST `/book`, fee endpoints | paper path only on signal |
+| METAR/SPECI | AviationWeather + CheckWX; dual-source **on ARM only** | weatherbot `metar_observer` |
+| TAF TX/TN | CheckWX / AWC | optional; market consensus is fallback |
 
-- NO of broken bucket: hold to settlement unless a corrected METAR retracts the break (rare). Take profit if NO bid ≥ 0.85.
-- YES of new bucket: if running extreme leaves this bucket too, flip — sell YES / do not hero-hold. This is a one-bucket ride, not a trend follower.
+**Do not** REST-poll books on the fire path. Subscribe early, keep LocalOrderBook fresh, FAK against in-memory L2.
 
-## How to react before the crowd
+## Hardware / latency
 
-The 120s observer loop is too slow. Use a two-stage runtime:
+- Low-latency VPS near Polymarket infra (commonly **US East**), stable UDP/TCP, no residential CGNAT.
+- Co-locate process: METAR parse + consensus state + WS books + signer in **one process / shared memory**.
+- Avoid disk/SQLite on the fire path; append-only audit after.
+- China egress: mirrored WSL or overseas VPS; Telegram optional via relay.
 
-### Stage A — ARM (before the break)
-
-When `distance(running_extreme, TAF_extreme) <= arm_c` (default 1.0°C) **and** local hour is in the window (high ≥ 14, low ≤ 10):
-
-- Pin that station to a **fast poll** (5–10s), dual source if possible (aviationweather + checkwx).
-- Prefetch both token ids, tick size, and live WS books.
-- Pre-build unsigned / signed order templates for:
-  - BUY NO broken bucket @ cap
-  - BUY YES next bucket @ cap
-- Keep WS book warm. Do not discover the token after the break.
-
-### Stage B — FIRE (on first accepted break)
-
-Break rule (high):
-
-```
-obs_ok AND running_max > taf_tx
-AND new_bucket == taf_bucket + 1
-AND local_hour >= fire_hour
-AND (obs_count_after_arm >= 1)
-AND not already fired today
-```
-
-Then submit both FAK legs in parallel with a **time budget of ~8 seconds**. After that, cancel remainder. Do not walk the cap.
-
-### What actually makes you earlier
-
-- Fast poll only on armed stations, not 49 cities.
-- Parse METAR `obs_time`, ignore stale copies of the same observation.
-- Treat a new observation timestamp as the event, not "any JSON 200".
-- Books already in memory; no REST fan-out after the trigger.
-- FAK at `min(best_ask + 1 tick, cap)`, not GTC that sits behind the queue.
-- One process, in-memory state. Disk/SQLite on the fire path is too slow.
-
-You will not beat a colocated market maker. You can beat a 2-minute scanner.
-
-## Fill module (`re_execution.py`)
-
-Design: **arm → fire FAK → hard cap → short ladder → abort**.
-
-```
-for each leg:
-  t=0ms   FAK size@min(ask, cap)
-  t=1500  if unfilled and ask_now <= cap: FAK remainder@min(ask+1tick, cap)
-  t=4000  if unfilled and still <= cap: FAK remainder@cap
-  t=8000  abort leftover. never lift through cap
-```
-
-Rules:
-
-- No cap walk. If the book is already 0.70 after the scramble, you are late. Stand down.
-- Parallel legs, independent abort.
-- Paper path must simulate against the same L2 snapshot, not mid.
-- Live path must use already-reconciled balances; fire path cannot wait for a full account refresh.
-- Dedup key: `city|date|direction|broken_bucket|new_bucket` so a second METAR copy cannot double fire.
-
-## State machine
-
-```
-IDLE --(near TAF, in hour window)--> ARMED
-ARMED --(break +1 bucket, fresh obs)--> FIRED
-ARMED --(extreme moves away / hour ends)--> IDLE
-FIRED --(done / abort)--> COOLDOWN (no re-fire same day/direction)
-```
+Go/Rust can shave parse/WS jitter, but **your bottleneck is METAR publish lag + CLOB RTT**, not Python’s microseconds. Keep strategy in Python until live path is proven; rewrite only the hot path (WS decode, order build, HTTP/2 post) if profiling shows need.
 
 ## Config
 
-```json
-{
-  "mode": "paper",
-  "weatherbotyes2re_enabled": true,
-  "arm_c": 1.0,
-  "max_bucket_jump": 1,
-  "no_max_ask": "0.62",
-  "yes_max_ask": "0.48",
-  "no_notional_pct": 0.70,
-  "yes_notional_pct": 0.30,
-  "fast_poll_seconds": 8,
-  "fire_budget_ms": 8000,
-  "high_fire_local_hour": 14,
-  "low_fire_local_hour_end": 10,
-  "require_fresh_obs_seconds": 180,
-  "yes_leg_enabled": true
-}
-```
+See `config.example.json`.
 
 ## Files
 
-- `reversal_strategy.py` — arm/fire rules, break detection, two-leg sizing.
-- `re_execution.py` — fill module: cap FAK ladder, time budget, dedup.
+- `reversal_strategy.py` — arm/fire + consensus gate
+- `consensus_tracker.py` — rolling YES TWAP / rank
+- `re_execution.py` — capped FAK ladder + paper L2 match
+- `paper_reversal_sim.py` — scenarios + loop
 
-Wire into weatherbot by: (1) fast-poll armed ICAOs, (2) keep CLOB WS on the two tokens, (3) call `maybe_fire_reversal` on each new METAR obs_time.
+## Paper
+
+```bash
+python3 tests_reversal.py
+python3 paper_reversal_sim.py --scenarios-only
+```
+
+## Safety
+
+Paper by default. No wallet in this repo. Live requires separate reconciled balances and a real executor.
