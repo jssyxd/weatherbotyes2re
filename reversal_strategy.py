@@ -28,7 +28,9 @@ NO_NOTIONAL_PCT = Decimal("0.75")
 YES_NOTIONAL_PCT = Decimal("0.25")
 HIGH_FIRE_LOCAL_HOUR = 14
 LOW_FIRE_LOCAL_HOUR_END = 10
-REQUIRE_FRESH_OBS_SECONDS = 180
+REQUIRE_FRESH_OBS_SECONDS = 180  # legacy absolute-age gate — deprecated 2026-09-03 (see OBS_* window below)
+OBS_MAX_LOOKBACK_SECONDS = 5400  # 90 min sanity: obs older than this = stale feed, do not fire
+OBS_MAX_FUTURE_SECONDS = 900     # 15 min sanity: US AWS stations publish ~7 min EARLY; >15 min ahead = bad stamp
 CONSENSUS_WINDOW_SECONDS = 7200  # 2h default; config can set 3600
 CONSENSUS_MIN_SAMPLES = 20
 CONSENSUS_MIN_LEAD = Decimal("0.03")
@@ -175,7 +177,9 @@ def maybe_arm_or_fire(
     cfg = config or {}
     arm_c = float(cfg.get("arm_c", ARM_C))
     max_jump = int(cfg.get("max_bucket_jump", MAX_BUCKET_JUMP))
-    fresh_s = int(cfg.get("require_fresh_obs_seconds", REQUIRE_FRESH_OBS_SECONDS))
+    fresh_s = int(cfg.get("require_fresh_obs_seconds", REQUIRE_FRESH_OBS_SECONDS))  # legacy, unused by fire window
+    obs_lookback_s = int(cfg.get("max_obs_lookback_seconds", OBS_MAX_LOOKBACK_SECONDS))
+    obs_future_s = int(cfg.get("max_obs_future_seconds", OBS_MAX_FUTURE_SECONDS))
     high_hour = int(cfg.get("high_fire_local_hour", HIGH_FIRE_LOCAL_HOUR))
     low_hour_end = int(cfg.get("low_fire_local_hour_end", LOW_FIRE_LOCAL_HOUR_END))
     cons_win = int(cfg.get("consensus_window_seconds", CONSENSUS_WINDOW_SECONDS))
@@ -270,8 +274,19 @@ def maybe_arm_or_fire(
     # jump > 0 : potential break
     if not hour_ok(direction, local_hour, high_hour, low_hour_end):
         return [{"action_type": "re_skip", "reason": "hour_not_in_window", "key": key, "jump": jump}]
-    if not obs_is_fresh(obs_time_utc, now_utc, fresh_s):
+    # Freshness = "a NEW observation arrived" (deduped by is_new_obs_time
+    # above) — NOT "the observation happened within N seconds". METAR/SPECI
+    # run on a 20-60 min cadence: obs_time age swings 0-60 min between
+    # reports by design (US AWS publish ~7 min EARLY, others 1-8 min late).
+    # An absolute age gate (<=180s) structurally killed every fire with
+    # stale_obs while obs were perfectly current (0 trades, 2026-09-03).
+    # Sanity window only: reject a stalled feed (>90 min behind) and
+    # impossible future stamps (>15 min ahead).
+    if obs_time_utc is None:
         return [{"action_type": "re_skip", "reason": "stale_obs", "key": key}]
+    obs_age = (now_utc.astimezone(timezone.utc) - obs_time_utc.astimezone(timezone.utc)).total_seconds()
+    if obs_age > obs_lookback_s or obs_age < -obs_future_s:
+        return [{"action_type": "re_skip", "reason": "stale_obs", "key": key, "obs_age_s": round(obs_age, 1)}]
 
     broken = taf_b
     broken_id = str(broken.get("bucket_id") or broken.get("id") or "")

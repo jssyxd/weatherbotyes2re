@@ -108,11 +108,13 @@ def scenario_two_bucket_yes_skipped():
 
 
 def scenario_stale_obs_no_fire():
+    # 2026-09-03 window semantics: stale = obs older than 90 min (was 180 s).
+    # 10-min-old obs is a NORMAL hourly-cadence gap and must be able to fire.
     state={}; city=make_city(); buckets=make_buckets()
     now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
     seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now-timedelta(minutes=10), now, {}, PAPER_CFG, tracker)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now-timedelta(minutes=100), now, {}, PAPER_CFG, tracker)
     return {"name":"stale_obs_no_fire","types":[a["action_type"] for a in actions],"ok":all(a.get("action_type")!="re_fire" for a in actions)}
 
 
