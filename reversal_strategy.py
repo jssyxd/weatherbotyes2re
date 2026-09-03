@@ -22,7 +22,7 @@ from consensus_tracker import ConsensusTracker, DEFAULT_TRACKER
 
 ARM_C = 1.0
 MAX_BUCKET_JUMP = 1
-NO_MAX_ASK = Decimal("0.65")
+NO_MAX_ASK = Decimal("0.85")
 YES_MAX_ASK = Decimal("0.48")
 NO_NOTIONAL_PCT = Decimal("0.75")
 YES_NOTIONAL_PCT = Decimal("0.25")
