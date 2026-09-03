@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Paper entry — full path in runner_impl / _r_*.py. No sigma/bias grid."""
+"""Paper entry — runner_impl / _r_*.py. No sigma/bias grid."""
 from __future__ import annotations
 import sys
 from runner_impl import main
