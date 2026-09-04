@@ -29,8 +29,18 @@ def initial_capital_usdc(state: dict[str, Any]) -> Decimal:
 
 
 def total_debit_usdc(state: dict[str, Any]) -> Decimal:
-    """Return the running paper cash outflow (principal + fees) so far."""
-    return _decimal(state.get("paper_total_debit_usdc"), Decimal("0"))
+    """Return the running paper cash outflow (principal + fees) so far.
+
+    MAY be negative since 2026-09-04: a negative total debit means realized
+    wins exceed cumulative cost (equity = initial - debit > initial). Read
+    directly, NOT through ``_decimal`` (whose parsed>=0 filter would clamp a
+    negative balance to zero and hide realized profit).
+    """
+    try:
+        parsed = Decimal(str(state.get("paper_total_debit_usdc") or 0))
+    except Exception:
+        return Decimal("0")
+    return parsed if parsed.is_finite() else Decimal("0")
 
 
 def remaining_capital_usdc(state: dict[str, Any]) -> Decimal:
@@ -60,15 +70,20 @@ def release(state: dict[str, Any], amount_usdc: Any) -> Decimal:
     """Credit paper cash back after a simulated sell (reduce total debit).
 
     Used by paper exit settlement so overturned positions free capital and
-    realized PnL is reflected in the ledger. Never goes below zero debit.
+    realized PnL is reflected in the ledger.
+
+    NOTE (2026-09-04 fix): total debit MAY go negative — a negative total
+    debit means realized wins exceed cumulative cost, and ``remaining =
+    initial - debit`` then correctly reports equity above the starting
+    capital. The previous clamp-to-zero silently discarded realized profit
+    (e.g. cost 49.06 vs payout 101.86 -> debit clamped from -52.80 to 0.00,
+    hiding +52.80 of paper profit).
     """
     amount = Decimal(str(amount_usdc))
     if amount < 0:
         raise ValueError("paper credit must be non-negative")
     initial = initial_capital_usdc(state)
     new_total = (total_debit_usdc(state) - amount).quantize(Decimal("0.00001"))
-    if new_total < 0:
-        new_total = Decimal("0")
     state["paper_initial_capital_usdc"] = float(initial)
     state["paper_total_debit_usdc"] = float(new_total)
     return new_total

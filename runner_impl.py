@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from reversal_strategy import ensure_re_state
 from _r_state import load_config, load_state, save_state, log_event, STATE_VERSION
 from _r_cycle import run_cycle
 from _r_exec import write_health
+from research import common as _common_adapter
 
 
 def main() -> int:
@@ -20,6 +22,13 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    # Optional CheckWX key from .env (AWC works keyless). Never logged.
+    _env = {}
+    try:
+        _env = _common_adapter.load_env()
+    except Exception:
+        _env = {}
+    cfg["_checkwx_key"] = os.environ.get("CHECKWX_API_KEY") or _env.get("CHECKWX_API_KEY")
     state = load_state(cfg["state_path"])
     if state.get("version") != STATE_VERSION:
         capital = state.get("paper_initial_capital_usdc", cfg["paper_initial_capital_usdc"])

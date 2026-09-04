@@ -1,12 +1,77 @@
-"""Process-local caches for paper runner. No sigma."""
+"""Process-local caches for the weatherbotyes2re paper runner. No sigma.
+
+Owns long-lived per-process objects that must survive across ``run_cycle``
+calls but must not be rebuilt from disk every tick:
+  - the :class:`ConsensusTracker` (rolling per-bucket TWAP history)
+  - the read-only CLOB client
+  - last-fetch epoch stamps (cadence gating)
+  - the normalized in-memory ladder book cache ``{token_id: book_dict}``
+None of these are serialized; they are warm-up state only.
+"""
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 from typing import Any
+
+from clob_market_data import CLOBMarketData
 from consensus_tracker import ConsensusTracker
 
 _TRACKER: ConsensusTracker | None = None
-_LAST_TAF: dict[str, Any] = {"at": 0.0, "extreme": {}}
-_LAST_RULES: dict[str, Any] = {"at": 0.0, "rules": [], "by_city_date": {}}
-_LAST_IDLE_METAR: float = 0.0
-_LAST_IDLE_BOOK: float = 0.0
-_METAR_CACHE: dict[str, dict[str, Any]] = {}
-_BOOK_CACHE: dict[str, dict] = {}
+_CLOB: CLOBMarketData | None = None
+
+# {token_id: ladder book dict}  (best_ask/best_bid/tick_size/asks[{price,size}])
+_BOOK_CACHE: dict[str, dict[str, Any]] = {}
+
+
+@dataclass
+class Stamp:
+    at: float = 0.0
+
+
+_STAMPS: dict[str, Stamp] = {}
+
+
+def stamp(name: str) -> float:
+    s = _STAMPS.get(name)
+    return s.at if s else 0.0
+
+
+def bump(name: str, now: float) -> None:
+    s = _STAMPS.get(name)
+    if s is None:
+        _STAMPS[name] = Stamp(at=now)
+    else:
+        s.at = now
+
+
+def tracker() -> ConsensusTracker:
+    """Process-local singleton consensus/gate history."""
+    global _TRACKER
+    if _TRACKER is None:
+        _TRACKER = ConsensusTracker(window_seconds=7200, min_samples=20)
+    return _TRACKER
+
+
+def clob(timeout_seconds: float = 8.0) -> CLOBMarketData:
+    """Process-local read-only CLOB client (never signs / submits orders)."""
+    global _CLOB
+    if _CLOB is None:
+        _CLOB = CLOBMarketData(timeout_seconds=timeout_seconds)
+    return _CLOB
+
+
+def book_cache() -> dict[str, dict[str, Any]]:
+    return _BOOK_CACHE
+
+
+# Per-cycle observability surface surfaced to write_health for the watcher.
+_HEALTH_EXTRA: dict[str, Any] = {}
+
+
+def set_health_extra(data: dict[str, Any]) -> None:
+    _HEALTH_EXTRA.clear()
+    _HEALTH_EXTRA.update(data)
+
+
+def health_extra() -> dict[str, Any]:
+    return dict(_HEALTH_EXTRA)

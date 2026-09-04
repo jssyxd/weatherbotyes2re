@@ -37,6 +37,7 @@ from adapters.polymarket.orderbook import from_any
 from paper_capital import reserve
 from research import common
 from reversal_strategy import ensure_re_state, maybe_arm_or_fire
+from ws_bridge import ws_bridge
 
 LOG_FIELDS = None
 ZERO = Decimal("0")
@@ -193,6 +194,34 @@ def refresh_books(cfg: dict[str, Any], token_ids: list[str], now_utc: datetime) 
         cache[tid] = ladder
         fresh[tid] = ladder
     return fresh
+
+
+def _ws_pump(wsb: Any, cache: dict[str, Any], max_age_s: float = 5.0) -> int:
+    """Overlay fresh (<max_age_s) WS-fed LocalOrderBook snapshots onto the
+    ladder cache. A snapshot only overwrites the cached ladder when it is
+    strictly newer (fetched_at_epoch comparison) — a quiet/stale WS book can
+    never clobber a fresher REST ladder."""
+    stream = getattr(wsb, "stream", None)
+    if stream is None:
+        return 0
+    n = 0
+    now_e = time.time()
+    for tid, lb in list(stream.books.items()):
+        try:
+            if lb.is_fresh(max_age_s, now=now_e):
+                snap = lb.snapshot()
+                ladder = _normalize_snapshot(tid, snap)
+                if ladder is None:
+                    continue
+                cur = cache.get(tid)
+                new_epoch = float(ladder.get("fetched_at_epoch") or 0)
+                old_epoch = float((cur or {}).get("fetched_at_epoch") or 0)
+                if new_epoch >= old_epoch:
+                    cache[tid] = ladder
+                    n += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return n
 
 
 # --------------------------------------------------------------------------- #
@@ -423,6 +452,22 @@ def run_cycle(
         bump("book", time.time())
     cache = book_cache()
 
+    # ---- WebSocket bridge: live L2 overlay on the ladder cache ------------ #
+    # WS feeds LocalOrderBook per token on a daemon thread (self-reconnecting);
+    # every cycle we overlay any fresh (<5 s) local snapshot onto the ladder
+    # cache, so paper FAK sees sub-second book updates when the feed is live.
+    # REST /books above remains the correctness backbone and seeds on startup.
+    wsb = ws_bridge()
+    if cfg.get("market_ws_enabled", True) and tokens:
+        if not wsb.running:
+            try:
+                wsb.start(tokens)
+            except Exception as exc:  # noqa: BLE001
+                log_event(log_path, {"type": "ws_start_failed", "error": f"{type(exc).__name__}: {exc}"})
+        wsb.ensure_tokens(tokens)
+        _ws_pump(wsb, cache)
+    ws_tel = wsb.telemetry()
+
     # 3) METAR
     # Armed cities get fast METAR; idle ones at idle cadence. For v1 here we
     # fetch all on the book cadence and let strategy gate stale/duplicate.
@@ -574,9 +619,8 @@ def run_cycle(
             "oldest_age_s": max((a for a in book_age_s.values() if a is not None), default=None),
             "per_token_sample": {k: book_age_s[k] for k in list(book_age_s)[:6]},
         },
-        # Polymarket market websocket is optional in this paper (REST-seed)
-        # deployment; report its state explicitly so the watcher never assumes.
-        "websocket_market": {"deployed": False, "mode": "REST_seed_only"},
+        # Polymarket market websocket: live when the bridge thread is up.
+        "websocket_market": ws_tel,
         "clob": {"mode": "read_only", "submits_orders": False},
         "gamma": {"mode": "public_read_only", "events_discovered": len(rules_idx) // 2 if rules_idx else 0},
         "signal_latency_s": {"not_yet_fired": True},

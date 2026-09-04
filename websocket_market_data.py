@@ -48,7 +48,7 @@ class MarketStream:
         self.connected = False
         self.subscribed = False
         self.last_error = reason
-        for book in self.books.values():
+        for book in list(self.books.values()):  # copy: caller thread may grow dict
             book.invalidate()
 
     def mark_subscribed(self) -> None:
