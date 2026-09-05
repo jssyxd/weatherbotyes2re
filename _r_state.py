@@ -29,7 +29,7 @@ DEFAULTS: dict[str, Any] = {
     "fast_poll_interval_seconds": 8,
     "idle_metar_interval_seconds": 45,
     "idle_book_interval_seconds": 30,
-    "arm_metar_interval_seconds": 8,
+    "arm_metar_interval_seconds": 10,
     "arm_book_interval_seconds": 8,
     "rules_refresh_interval_seconds": 1200,
     "taf_refresh_interval_seconds": 1800,
@@ -89,6 +89,7 @@ def _validate_config(cfg: dict[str, Any], source: Path) -> None:
         "scan_interval_seconds",
         "fast_poll_interval_seconds",
         "idle_metar_interval_seconds",
+        "arm_metar_interval_seconds",
         "idle_book_interval_seconds",
     ]
     for k in intervs:

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 from re_execution import paper_match_fak, plan_fire_cycle, size_legs
-from reversal_strategy import maybe_arm_or_fire, ensure_re_state
+from reversal_strategy import maybe_arm_or_fire, ensure_re_state, prune_stale_sessions
 from consensus_tracker import ConsensusTracker
 TZ = "Asia/Shanghai"
 
@@ -166,6 +166,48 @@ def scenario_consensus_blocks_non_leader():
     }
 
 
+def scenario_prune_stale():
+    # Cross-day carryover / unknown-city / low-zombie cleanup of session caches.
+    city = make_city()
+    city["timezone"] = "UTC"  # scenario-local override; module TZ constant untouched
+    now = datetime(2026, 9, 5, 15, 0, tzinfo=timezone.utc)  # local date 2026-09-05, local hour 15
+    stale = {
+        "armed": {
+            "shanghai|2026-09-04|high": {"status": "armed"},  # yesterday -> prune
+            "shanghai|2026-09-05|low": {"status": "armed"},   # today low zombie (hour 15 > 10) -> prune
+            "atlantis|2026-09-05|high": {"status": "armed"},  # unknown city -> prune
+        },
+        "fired": {"shanghai|2026-09-04|high": {"status": "fired"}},  # yesterday -> prune
+        "running_extremes": {"shanghai|2026-09-04|high": {"value": 32.0}},  # yesterday -> prune
+        "last_obs_time": {"shanghai|2026-09-04|high": "2026-09-04T08:00:00Z"},  # yesterday -> prune
+    }
+    keep = {
+        "armed": {
+            "shanghai|2026-09-05|high": {"status": "armed"},  # today high -> keep
+            "not-a-session-key": {"status": "armed"},          # malformed (not 3 | parts) -> keep
+        },
+        "fired": {"shanghai|2026-09-05|high": {"status": "fired"}},  # today -> keep
+        "running_extremes": {},
+        "last_obs_time": {},
+    }
+    state = {"weatherbotyes2re": {"taf_forecasts": {"shanghai|2026-09-05|high": {"keep": True}},
+                                  "last_obs": {"shanghai|2026-09-05|high": {"keep": True}}}}
+    for sec, kv in stale.items():
+        state["weatherbotyes2re"][sec] = dict(kv)
+    for sec, kv in keep.items():
+        state["weatherbotyes2re"][sec].update(kv)
+    removed = prune_stale_sessions(state, [city], now)
+    tree = state["weatherbotyes2re"]
+    stale_left = [(sec, k) for sec, kv in stale.items() for k in kv if k in tree[sec]]
+    kept_missing = [k for k in ("shanghai|2026-09-05|high", "not-a-session-key") if k not in tree["armed"]] + \
+        [k for k in ("shanghai|2026-09-05|high",) if k not in tree["fired"]]
+    untouched = {"taf_forecasts": "shanghai|2026-09-05|high" in tree["taf_forecasts"],
+                 "last_obs": "shanghai|2026-09-05|high" in tree["last_obs"]}
+    ok = removed == 6 and not stale_left and not kept_missing and all(untouched.values())
+    return {"name": "prune_stale", "removed": removed, "ok": ok,
+            "stale_left": stale_left, "kept_missing": kept_missing, "untouched": untouched}
+
+
 def run_scenarios():
     results=[]; failed=0
     for fn in (
@@ -176,6 +218,7 @@ def run_scenarios():
         scenario_cap_abort,
         scenario_no_double_fire,
         scenario_consensus_blocks_non_leader,
+        scenario_prune_stale,
     ):
         r=fn(); results.append(r)
         if not r.get("ok"): failed += 1

@@ -471,6 +471,14 @@ def _record_fire_event(cfg, state, fire, position, ladlog, now_utc) -> None:
             "jump": fire.get("jump"),
             "ref_source": fire.get("ref_source"),
             "fills": fill_summary,
+            # First-hand evidence for why a fire did not fill: every FAK
+            # ladder intent (send_fak / abort_above_cap / no_book /
+            # abort_timeout / missing_token) with best_ask/cap/limit so the
+            # 15-min watcher can reverse-trace no-fill causes without guessing.
+            "ladder": [
+                {k: v for k, v in intent.items() if k != "fill"} | ({"fill": intent.get("fill")} if intent.get("fill") else {})
+                for intent in ladlog
+            ],
         },
     )
 

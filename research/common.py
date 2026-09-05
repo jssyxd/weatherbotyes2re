@@ -244,7 +244,16 @@ def dual_source_metar(
     *,
     now: datetime | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Merge CheckWX + AviationWeather; prefer the fresher observation.
+    """Dual-source METAR: CheckWX primary, AviationWeather (AWC) only backup.
+
+    When ``api_key`` is set, CheckWX is authoritative: every ICAO CheckWX
+    returns is adopted as-is with source ``"checkwx"`` — no freshness
+    comparison against AWC (CheckWX wins even when AWC would be newer).
+    AWC is queried only for the ICAOs CheckWX did not cover (source
+    ``"awc"``), so a CheckWX gap still yields an observation. When
+    ``api_key`` is empty/None the keyless mode serves the whole universe
+    from AWC (source ``"awc"``). A CheckWX outage degrades to pure AWC;
+    an AWC error is swallowed (per-batch, see ``aviationweather_metar``).
 
     Returns {icao: {"raw": str, "temp_c": float|None, "obs_time": datetime|None, "source": str}}
     """
@@ -255,34 +264,27 @@ def dual_source_metar(
             check = checkwx_metar(icaos, api_key)
         except RuntimeError:
             check = {}
-    try:
-        awc = aviationweather_metar(icaos)
-    except Exception:
-        awc = {}
+    # AWC only fills CheckWX gaps; with no key it serves everything itself.
+    awc_icaos = [i for i in icaos if i not in check] if api_key else list(icaos)
+    awc: dict[str, str] = {}
+    if awc_icaos:
+        try:
+            awc = aviationweather_metar(awc_icaos)
+        except Exception:
+            awc = {}
 
     out: dict[str, dict[str, Any]] = {}
     for icao in icaos:
-        candidates: list[tuple[str, str]] = []
-        if icao in check:
-            candidates.append(("checkwx", check[icao]))
-        if icao in awc:
-            candidates.append(("awc", awc[icao]))
-        if not candidates:
+        if api_key and icao in check:
+            raw, src = check[icao], "checkwx"
+        elif icao in awc:
+            raw, src = awc[icao], "awc"
+        else:
             continue
-        best = None
-        best_src = None
-        best_obs = None
-        for src, raw in candidates:
-            obs = parse_obs_time_utc(raw, now)
-            if best is None:
-                best, best_src, best_obs = raw, src, obs
-                continue
-            if obs is not None and (best_obs is None or obs > best_obs):
-                best, best_src, best_obs = raw, src, obs
         out[icao] = {
-            "raw": best,
-            "temp_c": parse_metar_temp_c(best or ""),
-            "obs_time": best_obs,
-            "source": best_src,
+            "raw": raw,
+            "temp_c": parse_metar_temp_c(raw),
+            "obs_time": parse_obs_time_utc(raw, now),
+            "source": src,
         }
     return out

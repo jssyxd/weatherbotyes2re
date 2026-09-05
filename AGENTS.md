@@ -79,7 +79,7 @@ No lint, formatter, or CI script exists. Python 3.13 required (`.pyc` artifacts 
 - **State machine = one dict**, per `session_key = city|date|direction` (`armed`/`fired`/`running_extremes`). One-fire-per-session and duplicate-`obs_time` dedup are invariants.
 - **Config passing, not a framework.** `config` (a parsed JSON dict) and an explicit `ConsensusTracker` instance (default `DEFAULT_TRACKER`) are threaded into pure functions. Constructor injection of `clock`/`timeout_seconds` used in adapters for testability.
 - **Named private-module prefix** for the runner internals: `_r_globals.py` (`_r_state`/`_r_cycle`/`_r_exec` intended). `_r_globals` holds only process-local caches (tracker singleton, METAR/book/TAF & rules stamps).
-- **Dual-rate polling:** idle cadence (~45s METAR / ~30s books, `scan_interval_seconds` 20) vs **ARM fast-poll** of only the armed ICAOs (~8s). During ARM the full universe still samples slowly to feed consensus.
+- **Dual-rate polling:** idle cadence (~60s METAR / ~30s books, `scan_interval_seconds` 20) vs **ARM fast-poll** of only the armed ICAOs (~10s). During ARM the full universe still samples slowly to feed consensus.
 
 ## Important Files
 

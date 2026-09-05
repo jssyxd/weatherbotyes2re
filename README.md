@@ -12,7 +12,7 @@ METAR vs consensus **reversal** — see the break early, paper-fill before the s
 - New `obs_time`, age ≤ 180s; high local hour ≥ 14; low ≤ 10.
 - Broken bucket must be rank-1 over `consensus_window_seconds` (default 7200).
 - Legs: BUY NO broken (cap 0.65, 75%) + optional BUY YES new (cap 0.48, 25%).
-- Idle ~20s; **ARM** → fast poll those ICAOs (~8s) while **full universe** still samples books/METAR slowly for consensus.
+- Idle ~20s; **ARM** → fast poll those ICAOs (~10s) while **full universe** still samples books/METAR slowly for consensus.
 - FIRE: in-memory L2 FAK, 8s budget, abort above cap. One fire per `city|date|direction`.
 
 ## Data path

@@ -58,11 +58,11 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
     tick = tick_of(book)
     token = leg.get("token_id")
     if token is None:
-        return {"status": "missing_token", "leg": leg.get("leg")}
+        return {"status": "missing_token", "leg": leg.get("leg"), "cap": str(cap), "reason": "token_id_missing_in_fire_spec"}
     if elapsed_ms > budget_ms:
-        return {"status": "abort_timeout", "leg": leg.get("leg"), "unfilled": str(target_shares)}
+        return {"status": "abort_timeout", "leg": leg.get("leg"), "token_id": token, "cap": str(cap), "elapsed_ms": elapsed_ms, "budget_ms": budget_ms, "unfilled": str(target_shares)}
     if ask is None:
-        return {"status": "no_book", "leg": leg.get("leg")}
+        return {"status": "no_book", "leg": leg.get("leg"), "token_id": token, "cap": str(cap), "elapsed_ms": elapsed_ms, "note": "no_resting_ask_in_ladder"}
     # Ladder: 0ms flat, 1500ms +1 tick, 4000ms still at +1 (cap-bounded)
     extra = 0
     if elapsed_ms >= LADDER_MS[1]:

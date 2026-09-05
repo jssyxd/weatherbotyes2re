@@ -1,9 +1,9 @@
 {
  "mode": "paper",
  "scan_interval_seconds": 20,
- "fast_poll_interval_seconds": 5,
+  "fast_poll_interval_seconds": 5,
  "idle_metar_interval_seconds": 60,
- "arm_metar_interval_seconds": 5,
+  "arm_metar_interval_seconds": 5,
  "idle_book_interval_seconds": 30,
  "rules_refresh_interval_seconds": 1200,
  "taf_refresh_interval_seconds": 1800,
@@ -20,8 +20,8 @@
  "strategy": {
   "arm_c": 1.0,
   "max_bucket_jump": 1,
-  "no_max_ask": "1.0",
-  "yes_max_ask": "1.0",
+  "no_max_ask": "0.85",
+  "yes_max_ask": "0.48",
   "no_notional_pct": "0.75",
   "yes_notional_pct": "0.25",
   "yes_leg_enabled": true,
