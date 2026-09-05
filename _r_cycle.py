@@ -160,6 +160,80 @@ def _all_tokens_for_rules(rules: dict[str, Any]) -> list[str]:
     return tokens
 
 
+def _rule_ref_extreme(rule: dict[str, Any], state: dict[str, Any]) -> float | None:
+    """Reference extreme (market units) for a rule, from armed-session state if
+    present, else None. The armed record stores the reference the strategy is
+    currently watching (ref_extreme), which is exactly the bucket whose NO we
+    would buy on a breach — so its ±1 neighbours are the fire-critical tokens."""
+    tree = state.get("weatherbotyes2re", {})
+    key = _rules_key(rule.get("city_id"), rule.get("market_local_date"), rule.get("direction"))
+    armed = (tree.get("armed") or {}).get(key)
+    if armed and armed.get("ref_extreme") is not None:
+        try:
+            return float(armed["ref_extreme"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _warm_tokens_for_rules(rules: dict[str, Any], state: dict[str, Any]) -> list[str]:
+    """Fire-critical token subset to keep hot while sessions are armed.
+
+    For every rule with an armed session we derive the reference bucket from
+    the armed ref_extreme, then collect:
+      - the reference bucket's NO token   (fire leg: BUY NO broken bucket)
+      - the neighbour bucket on the likely breach side — high direction: the
+        next-higher bucket (a higher observed extreme breaks into it, so its
+        YES is the second fire leg); low direction: the next-lower bucket
+      - that neighbour's NO token too (so a 2-bucket TAF breach can still fill)
+    Buckets are located in temperature order around the reference. Boundary
+    buckets (lo/hi None — "≤x" / "≥x") are handled the same way the strategy
+    does: a None bound never excludes a value on that side.
+
+    Returns a small deduped token list (tens, not the ~1000-token full set) so
+    the armed fast-poll can refresh just these every few seconds and a fire
+    finds a warm book instead of no_book.
+    """
+    warm: list[str] = []
+    for rule in rules.values():
+        ref = _rule_ref_extreme(rule, state)
+        if ref is None:
+            continue
+        buckets = rule.get("buckets", [])
+        if not buckets:
+            continue
+        # order by lo where present; open lower bound sorts first
+        def _lo_key(b: dict[str, Any]) -> float:
+            lo = b.get("lo")
+            return float(lo) if lo is not None else float("-inf")
+        ordered = sorted(buckets, key=_lo_key)
+        # find the bucket containing the reference extreme (None bound = open)
+        idx = None
+        for i, b in enumerate(ordered):
+            lo = b.get("lo")
+            hi = b.get("hi")
+            if (lo is None or ref >= float(lo)) and (hi is None or ref < float(hi)):
+                idx = i
+                break
+        if idx is None:
+            continue
+        ref_bucket = ordered[idx]
+        # likely breach neighbour
+        if rule.get("direction") == "high":
+            nxt = ordered[idx + 1] if idx + 1 < len(ordered) else None
+        else:
+            nxt = ordered[idx - 1] if idx - 1 >= 0 else None
+        cands = [ref_bucket]
+        if nxt is not None:
+            cands.append(nxt)
+        for b in cands:
+            for side in ("no_token_id", "yes_token_id"):
+                tok = str(b.get(side) or "")
+                if tok and tok not in warm:
+                    warm.append(tok)
+    return warm
+
+
 def _normalize_snapshot(token_id: str, snapshot: Any) -> dict[str, Any] | None:
     """Turn any CLOB/WS book snapshot into the pure ladder-dict the strategy
     and ``paper_match_fak`` were written against:
@@ -542,11 +616,23 @@ def run_cycle(
     # token set from every *enabled active* rule bucket
     tokens = _all_tokens_for_rules(rules_idx)
     book_ttl = float(cfg.get("idle_book_interval_seconds", DEFAULTS["idle_book_interval_seconds"]))
-    armed_only_book = armed_keys and not force_books
+    arm_book_ttl = float(cfg.get("arm_book_interval_seconds", DEFAULTS["arm_book_interval_seconds"]))
     do_book = force_books or (time.time() - stamp("book") >= book_ttl)
     if do_book and tokens:
         refresh_books(cfg, tokens, now)
         bump("book", time.time())
+    # Armed fast-path: while any session is armed, keep the fire-critical
+    # token subset (reference-bucket NO + breach-neighbour buckets from each
+    # armed rule) hot on the armed cadence. The full-universe pull above is
+    # ~1000 tokens and only runs on the idle TTL; without this fast path a
+    # fire's legs frequently find no_book because their tokens were never
+    # refreshed since the previous idle pull (or fell out of a chunk that
+    # timed out). Warm subset is tens of tokens — cheap to refresh every few
+    # seconds and exactly what plan_fire_cycle needs at fire time.
+    warm_tokens = _warm_tokens_for_rules(rules_idx, state)
+    if armed_keys and not do_book and warm_tokens and (time.time() - stamp("book_fast")) >= arm_book_ttl:
+        refresh_books(cfg, warm_tokens, now)
+        bump("book_fast", time.time())
     cache = book_cache()
 
     # ---- WebSocket bridge: live L2 overlay on the ladder cache ------------ #

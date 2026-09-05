@@ -262,6 +262,21 @@ def maybe_arm_or_fire(
     if key in tree["fired"]:
         return [{"action_type": "re_skip", "reason": "already_fired", "key": key}]
 
+    # Open-position cap: never open a new position while the number of
+    # unsettled paper positions is at/over max_open_positions. Prevents
+    # unbounded concurrent exposure when fires fill but settlements lag
+    # (max_open_positions previously existed only as a DEFAULTS entry with no
+    # enforcement — positions could stack past the cap).
+    max_open = int(cfg.get("max_open_positions") or 0)
+    if max_open > 0:
+        open_count = sum(
+            1 for p in (state.get("positions") or {}).values()
+            if not p.get("settled")
+        )
+        if open_count >= max_open:
+            return [{"action_type": "re_skip", "reason": "max_open_positions",
+                     "key": key, "open": open_count, "cap": max_open}]
+
     # Duplicate obs_time guard (must run after fired check so we still record books)
     if not is_new_obs_time(state, key, obs_time_utc):
         return [{"action_type": "re_skip", "reason": "duplicate_obs_time", "key": key}]

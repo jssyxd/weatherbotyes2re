@@ -38,6 +38,12 @@ def main() -> int:
             "version": STATE_VERSION,
             "paper_initial_capital_usdc": capital,
         }
+    # A freshly blanked state (no file on disk) carries the DEFAULTS capital
+    # because load_state blanks with an empty cfg. Force the run-config value
+    # only when no ledger activity exists yet (no positions, no debit): once
+    # the account has traded we must never rewrite initial capital.
+    if not state.get("positions") and not state.get("paper_total_debit_usdc"):
+        state["paper_initial_capital_usdc"] = float(cfg["paper_initial_capital_usdc"])
     state.setdefault("paper_initial_capital_usdc", cfg["paper_initial_capital_usdc"])
     ensure_re_state(state)
 
