@@ -428,6 +428,17 @@ def _paper_fire(
     budget_ms = int(fire.get("fire_budget_ms") or cfg.get("fire_budget_ms", 8000))
     now_ms = int(now_utc.timestamp() * 1000)
 
+    # If every leg's token is missing from the cache on the first attempt, do
+    # one targeted refresh of exactly the fire's tokens before the ladder
+    # starts — a fire that trips while the armed fast-poll hasn't refreshed
+    # yet (e.g. fresh arm on this very cycle) would otherwise spin all three
+    # ladder rungs as no_book and fill nothing.
+    fire_tokens = [str(l.get("token_id") or "") for l in fire.get("legs", []) if l.get("token_id")]
+    missing = [t for t in fire_tokens if t not in cache]
+    if missing:
+        refresh_books(cfg, missing, now_utc)
+        cache = book_cache()
+
     for elapsed in (0, 1500, 4000):
         if elapsed > budget_ms:
             break

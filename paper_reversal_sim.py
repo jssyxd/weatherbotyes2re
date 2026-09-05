@@ -97,6 +97,10 @@ def scenario_one_bucket_fill():
 
 
 def scenario_two_bucket_yes_skipped():
+    # YES-primary strategy (2026-09-05): a TAF-sourced 2-bucket jump keeps the
+    # momentum YES leg on the observed bucket and drops the broken-bucket NO
+    # leg (its book is routinely empty — holders of a practically-won NO never
+    # sell). Renamed semantics: "two_bucket_no_skipped".
     state={}; city=make_city(); buckets=make_buckets()
     now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
@@ -104,7 +108,8 @@ def scenario_two_bucket_yes_skipped():
     actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 33.2, now, now, {}, PAPER_CFG, tracker)
     fire=next((a for a in actions if a.get("action_type")=="re_fire"), None)
     legs=[x["leg"] for x in (fire or {}).get("legs", [])]
-    return {"name":"two_bucket_yes_skipped","types":[a["action_type"] for a in actions],"legs":legs,"ok":fire is not None and "buy_yes_new" not in legs and "buy_no_broken" in legs}
+    return {"name":"two_bucket_no_skipped","types":[a["action_type"] for a in actions],"legs":legs,
+            "ok":fire is not None and "buy_yes_new" in legs and "buy_no_broken" not in legs}
 
 
 def scenario_stale_obs_no_fire():

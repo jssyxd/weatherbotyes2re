@@ -410,9 +410,17 @@ def maybe_arm_or_fire(
             tree["armed"].pop(key, None)
             return [{"action_type": "re_skip", "reason": "jump_too_large_for_ref", "key": key,
                      "jump": jump, "ref_source": ref_source}]
-        actions.append({"action_type": "re_skip_yes", "reason": "jump_gt_one", "key": key, "jump": jump})
-        fire_yes = False
-        new_b = None
+        # TAF-sourced multi-bucket jump (2-bucket rare signal). YES-primary
+        # strategy: keep the momentum YES leg on the observed bucket (run_b);
+        # drop only the broken-bucket NO leg — its book is routinely empty
+        # (holders of a practically-won NO don't sell) and the momentum side
+        # is what carries the "keeps breaking" thesis.
+        fire_yes = True
+        new_b = run_b
+        _skip_no_leg = True
+        # mark the NO leg as skipped for the audit trail (re_skip_yes is now
+        # semantically the NO-leg skip under yes-primary sizing)
+        actions.append({"action_type": "re_skip_yes", "reason": "jump_gt_one_no_leg_skipped", "key": key, "jump": jump})
     elif jump > max_consensus_jump and ref_source != "taf":
         # same guard for the (jump <= max_jump but still > market-only cap)
         # case — unreachable while max_consensus_jump == max_jump, kept for
@@ -426,7 +434,18 @@ def maybe_arm_or_fire(
                  "jump": jump, "ref_source": ref_source}]
     else:
         fire_yes = bool(cfg.get("yes_leg_enabled", True))
-        new_b = run_b if jump == 1 else None
+        # new_b = the bucket the observed extreme has just entered. For a
+        # 1-bucket breach that is run_b (the immediate neighbour of the broken
+        # reference bucket). For a 2-bucket TAF breach the observed extreme
+        # still sits in a concrete bucket — buy ITS yes token (momentum leg),
+        # not nothing: with the yes-primary strategy the momentum leg is the
+        # tradeable side (broken-bucket NO books are routinely empty because
+        # holders of a practically-won NO never sell).
+        new_b = run_b
+        _skip_no_leg = False
+    # re-skip_yes suppression: with YES-primary we no longer drop the YES leg
+    # on a multi-bucket TAF jump — jump > max_jump only suppresses the NO leg.
+    # The jump>max_jump / market-ref guard above still returns before here.
 
     fire = {
         "key": key,
@@ -447,14 +466,15 @@ def maybe_arm_or_fire(
         "legs": [],
         "fire_budget_ms": int(cfg.get("fire_budget_ms", 8000)),
     }
-    fire["legs"].append({
-        "leg": "buy_no_broken",
-        "token_id": fire["broken_no_token"],
-        "side": "BUY",
-        "outcome": "NO",
-        "cap": str(cfg.get("no_max_ask", NO_MAX_ASK)),
-        "notional_pct": str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT)),
-    })
+    if not _skip_no_leg:
+        fire["legs"].append({
+            "leg": "buy_no_broken",
+            "token_id": fire["broken_no_token"],
+            "side": "BUY",
+            "outcome": "NO",
+            "cap": str(cfg.get("no_max_ask", NO_MAX_ASK)),
+            "notional_pct": str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT)),
+        })
     if fire_yes and new_b is not None:
         fire["legs"].append({
             "leg": "buy_yes_new",
