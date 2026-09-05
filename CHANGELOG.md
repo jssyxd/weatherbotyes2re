@@ -1,5 +1,30 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-05 — Capital & settlement tuning; remove ghost max_open_positions
+
+- **paper_initial_capital_usdc: 1000 → 5000.** First soak (2026-09-04) revealed
+  capital exhaustion after 7 concurrent fires (insufficient to sustain reversal
+  stream across 49-city universe). Increased 5x to allow ~20–25 simultaneous
+  positions before capital constraint (typical Polymarket daily weather window
+  has ~5–10 armed sessions in parallel).
+- **settle_grace_hours: 6 → 2; added settle_poll_seconds: 60.** Position
+  settlement polling was using the default 3600s (1h) cadence. Gamma resolution
+  API is fast (typically completes within 5–10 min of settlement time); the
+  1h grace window meant capital stayed locked for an hour post-resolution,
+  starving new fires. Reduced grace to 2h and poll every 60s so resolved
+  positions recycle capital into the available pool within 1–2 min of
+  settlement.
+- **Removed max_open_positions: 12.** Configuration parameter was unimplemented:
+  `_r_cycle.py` counts open positions only to decide settlement cadence, never
+  to gate fires. The limit created confusion (appearing active in config while
+  having no effect). Actual constraint is `paper_initial_capital_usdc` via
+  `paper_capital.reserve()`.
+- **Root cause audit:** Paper trading halted mid-stream because OPEN orders
+  (submitted but unfilled) + stale settlements (1h grace, 1h poll) formed a
+  capital lockup cascade. First 7 fires (all jump==1, solid signals) succeeded,
+  but positions held cash for hours; subsequent fires (jump>=2 or different
+  cities) couldn't reserve. Fixed by 5x capital + 60x faster settlement flow.
+
 ## 2026-09-04 — Fire deadlock fix; WS live feed; paper-ledger fix (audited)
 
 - **obs sanity window (was: absolute 180 s age gate → structurally zero fires).**
