@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from decimal import Decimal
 from typing import Any, Iterable
@@ -152,6 +153,50 @@ class CLOBMarketData:
         # chunks and only single-fetch the few tokens missing from each chunk,
         # so a partial snapshot fails closed instead of blocking the observer.
         parsed: dict[str, BookSnapshot] = {}
+        chunks = [ids[i : i + BOOKS_CHUNK_SIZE] for i in range(0, len(ids), BOOKS_CHUNK_SIZE)]
+        workers = min(10, len(chunks))
+        if workers <= 1:
+            for chunk in chunks:
+                parsed.update(self._fetch_book_chunk(chunk))
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for chunk_parsed in executor.map(self._fetch_book_chunk, chunks):
+                    parsed.update(chunk_parsed)
+        self._books.update(parsed)
+        return parsed
+
+    def _fetch_book_chunk(self, chunk: list[str]) -> dict[str, BookSnapshot]:
+        """Fetch one ≤100-token chunk; single-fetch the few tokens missing from it.
+
+        Fail-closed per chunk (a slow/timed-out chunk degrades only itself) and
+        safe to run concurrently with other chunks — this method touches no
+        shared mutable state (caller merges results)."""
+        parsed: dict[str, BookSnapshot] = {}
+        try:
+            raw = self._request_json(
+                BOOKS_ENDPOINT,
+                payload=[{"token_id": token} for token in chunk],
+                timeout=self.timeout_seconds,
+            )
+            items = raw if isinstance(raw, list) else raw.get("books", []) if isinstance(raw, dict) else []
+            for item in items:
+                if isinstance(item, dict) and item.get("asset_id") is not None:
+                    token = str(item["asset_id"])
+                    if token in chunk:
+                        parsed[token] = self._parse_book(token, item, "rest_batch")
+        except CLOBDataError:
+            pass
+        missing = [token for token in chunk if token not in parsed]
+        for token in missing:
+            try:
+                raw = self._request_json(
+                    f"{BOOK_ENDPOINT}?{urllib.parse.urlencode({'token_id': token})}",
+                    timeout=self.timeout_seconds,
+                )
+                parsed[token] = self._parse_book(token, raw, "rest_single")
+            except CLOBDataError:
+                continue
+        return parsed
         for chunk_start in range(0, len(ids), BOOKS_CHUNK_SIZE):
             chunk = ids[chunk_start:chunk_start + BOOKS_CHUNK_SIZE]
             try:

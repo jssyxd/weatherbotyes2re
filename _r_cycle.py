@@ -5,7 +5,7 @@ Reconstructs the intended ``_r_cycle`` module (the ``run_cycle`` import in
 modules; no sigma, no live orders, paper fills only. Every externally useful
 event is appended to the JSONL log for the watcher/Hermes layer.
 
-``run_cycle(cfg, state, now_utc) -> bool``  (True when anything is ARMed)
+``run_cycle(cfg, state, now_utc) -> bool``  (True while any session stays ARMed)
 
 Cycle responsibilities (cadence-gated per-process in :mod:`_r_globals`):
   1. load the active city universe (contract registry filtered by cfg)
@@ -36,18 +36,26 @@ from _r_state import DEFAULTS, log_event
 from adapters.polymarket.orderbook import from_any
 from paper_capital import reserve
 from research import common
-from reversal_strategy import ensure_re_state, maybe_arm_or_fire
+from reversal_strategy import ensure_re_state, maybe_arm_or_fire, prune_stale_sessions
 from ws_bridge import ws_bridge
 
 LOG_FIELDS = None
 ZERO = Decimal("0")
 
 # Which side token we sample for consensus.
-SAMPLE_SIDE = "yes_token_id"
-
 # Last-good METAR map, carried so telemetry (and the watcher reading health)
 # reports real per-city obs ages even between METAR fetches (~45s cadence).
 _LAST_GOOD_METAR: dict[str, dict[str, Any]] = {}
+
+# Last-good TAF parse map {ICAO: {tx_c, tn_c, issue_dt, tx_valid_utc, tn_valid_utc, raw}}.
+# TAF updates only every 4-6h; on pull failure we keep last-good and retry on
+# the next due cycle (fail closed, same contract as _LAST_GOOD_METAR).
+_LAST_GOOD_TAF: dict[str, dict[str, Any]] = {}
+
+# duplicate_obs_time skip logs throttled per key (expected every fast cycle at
+# 5s cadence — logging all of them would add ~98 lines/cycle to the JSONL).
+_DUP_LOG: dict[str, float] = {}
+_DUP_LOG_INTERVAL_S = 300.0
 
 
 # --------------------------------------------------------------------------- #
@@ -229,24 +237,96 @@ def _ws_pump(wsb: Any, cache: dict[str, Any], max_age_s: float = 5.0) -> int:
 # --------------------------------------------------------------------------- #
 def _fetch_metar(
     cfg: dict[str, Any],
-    cities: list[dict[str, Any]],
+    icaos: list[str],
     now_utc: datetime,
-    armed_keys: set[str],
-    key_to_city: dict[str, dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
-    """Dual-source METAR for the universe. Prefer freshness obs between sources.
+    """Dual-source METAR (CheckWX primary, AWC backup) for the given ICAO set.
 
-    Only returns entries; caller maps icao->city for strategy drive."""
-    icaos = sorted({str(c.get("icao")).upper() for c in cities})
+    The caller picks the subset: whole universe on the idle cadence, armed
+    ICAOs only on the fast cadence. Returns {icao: {raw, temp_c, obs_time,
+    source}}; on failure logs ``metar_fetch_failed`` and returns {} so the
+    caller keeps last-good obs and retries next cycle (fail closed)."""
+    icaos = sorted({str(i).upper() for i in icaos})
     if not icaos:
         return {}
     api_key = cfg.get("_checkwx_key")
     try:
-        obs = common.dual_source_metar(icaos, api_key, now=now_utc)
+        return common.dual_source_metar(icaos, api_key, now=now_utc)
     except Exception as exc:  # noqa: BLE001
         log_event(cfg.get("log_path"), {"type": "metar_fetch_failed", "error": f"{type(exc).__name__}: {exc}"})
         return {}
-    return obs
+
+
+def _fetch_taf(
+    cfg: dict[str, Any],
+    icaos: list[str],
+    now_utc: datetime,
+) -> dict[str, dict[str, Any]]:
+    """Fetch + parse TAF TX/TN for the given ICAO set via CheckWX.
+
+    Returns {ICAO: {tx_c, tn_c, issue_dt, tx_valid_utc, tn_valid_utc, raw}}.
+    Fail closed: on any error logs ``taf_fetch_failed`` and returns {} so the
+    caller keeps last-good TAFs and retries next due cycle. Without a CheckWX
+    key TAF is disabled (returns {}) and the strategy falls back to the
+    market-rank-1 consensus reference.
+    """
+    icaos = sorted({str(i).upper() for i in icaos})
+    if not icaos:
+        return {}
+    api_key = cfg.get("_checkwx_key")
+    if not api_key:
+        return {}
+    try:
+        raw_by_icao = common.checkwx_taf(icaos, api_key)
+        out: dict[str, dict[str, Any]] = {}
+        for icao, raw in raw_by_icao.items():
+            parsed = common.parse_tx_tn(raw)
+            if not parsed:
+                continue
+            issue_dt = common.parse_taf_issue_time(raw, ref_utc=now_utc)
+            entry: dict[str, Any] = {
+                "raw": raw,
+                "tx_c": parsed.get("tx_c"),
+                "tn_c": parsed.get("tn_c"),
+                "issue_dt": issue_dt.isoformat() if issue_dt else None,
+            }
+            if issue_dt is not None:
+                tx_day = parsed.get("tx_day")
+                tx_hour = parsed.get("tx_hour")
+                if tx_day and tx_hour is not None and parsed.get("tx_c") is not None:
+                    v = common.resolve_tx_valid_utc(issue_dt, tx_day, int(tx_hour))
+                    if v is not None:
+                        entry["tx_valid_utc"] = v.isoformat()
+                # TN uses the same day/hour fields on the TN side; resolve only
+                # when parse_tx_tn returned a TN day/hour (it stores them under
+                # tn_day/tn_hour). resolve_tx_valid_utc's day parsing expects
+                # the TX-style day token; TN tokens share the same format.
+                tn_day = parsed.get("tn_day")
+                tn_hour = parsed.get("tn_hour")
+                if tn_day and tn_hour is not None and parsed.get("tn_c") is not None:
+                    v = common.resolve_tx_valid_utc(issue_dt, tn_day, int(tn_hour))
+                    if v is not None:
+                        entry["tn_valid_utc"] = v.isoformat()
+            out[icao] = entry
+        return out
+    except Exception as exc:  # noqa: BLE001
+        log_event(cfg.get("log_path"), {"type": "taf_fetch_failed", "error": f"{type(exc).__name__}: {exc}"})
+        return {}
+
+
+def _armed_icaos(armed_keys: set[str], cities: list[dict[str, Any]]) -> set[str]:
+    """Map armed session keys (``city_id|local_date|direction``) to station ICAOs.
+
+    The fast METAR pull only re-polls the armed cities' stations, so a fresh
+    obs reaches ``maybe_arm_or_fire`` on the ~10s armed cadence instead of
+    waiting for the next ~60s full-universe pull."""
+    city_by_id = {str(c.get("city_id")): c for c in cities if c.get("city_id") is not None}
+    icaos: set[str] = set()
+    for key in armed_keys or ():
+        city = city_by_id.get(str(key).split("|", 1)[0])
+        if city is not None:
+            icaos.add(str(city.get("icao")).upper())
+    return icaos
 
 
 # --------------------------------------------------------------------------- #
@@ -407,10 +487,11 @@ def run_cycle(
     force_books: bool = False,
     force_rules: bool = False,
 ) -> bool:
-    """Run one full poll cycle. Returns True when any city/direction ARMed.
+    """Run one full poll cycle. Returns True while any session remains armed
+    (caller keeps fast cadence; prune drops stale sessions).
 
     Caller (``runner_impl``) chooses sleep cadence from the return value:
-    fast-poll (~8s) when armed, else scan interval (~20s)."""
+    fast-poll (~10s) when armed, else scan interval (~20s)."""
     now = now_utc or datetime.now(timezone.utc)
     log_path = cfg.get("log_path", "data/yes2re_events.jsonl")
     cities = load_active_cities(cfg)
@@ -436,6 +517,14 @@ def run_cycle(
         "rules": len(rules_idx),
         "failures": rule_failures,
     })
+
+    # Prune stale sessions before deriving armed_keys: the fast-poll / fast
+    # METAR subset must only ever see the cleaned set — yesterday's keys or
+    # low-direction zombies must not keep an ICAO hot-polled. prune never
+    # raises (contract), so no guard is needed here.
+    removed = prune_stale_sessions(state, cities, now)
+    if removed:
+        log_event(log_path, {"type": "prune_stale_sessions", "removed": removed})
 
     # Determine armed keys
     tree = ensure_re_state(state)
@@ -468,23 +557,65 @@ def run_cycle(
         _ws_pump(wsb, cache)
     ws_tel = wsb.telemetry()
 
-    # 3) METAR
-    # Armed cities get fast METAR; idle ones at idle cadence. For v1 here we
-    # fetch all on the book cadence and let strategy gate stale/duplicate.
+    # 3) METAR — dual-rate pulls.
+    # Full universe still runs on the idle cadence (stamp "metar", ~60s) and
+    # feeds consensus + every rule. While any session is armed, a fast subset
+    # pull of only the armed ICAOs additionally runs on the armed cadence
+    # (stamp "metar_fast", ~10s) so a fresh obs reaches the strategy ~10s after
+    # publication instead of ~60s. Both paths share common.dual_source_metar
+    # (CheckWX primary, AWC backup) and both bump their stamp only on a
+    # non-empty result: a failed pull leaves last-good in place and retries on
+    # the next due cycle instead of hammering every tick.
     idle_metar = float(cfg.get("idle_metar_interval_seconds", DEFAULTS["idle_metar_interval_seconds"]))
+    arm_metar = float(cfg.get("arm_metar_interval_seconds", DEFAULTS["arm_metar_interval_seconds"]))
     do_metar = force_metar or (time.time() - stamp("metar") >= idle_metar)
     metar_by_icao: dict[str, dict[str, Any]] = {}
     if do_metar:
-        fresh = _fetch_metar(cfg, cities, now, armed_keys, {})
+        # Full-universe pull (every configured city ICAO).
+        fresh = _fetch_metar(cfg, sorted({str(c.get("icao")).upper() for c in cities}), now)
         if fresh:
             _LAST_GOOD_METAR.clear()
             _LAST_GOOD_METAR.update(fresh)
-        metar_by_icao = fresh
-        bump("metar", time.time())
+            metar_by_icao = fresh
+            bump("metar", time.time())
+        else:
+            # Pull failed: keep surfacing last-good obs (never wipe them).
+            metar_by_icao = dict(_LAST_GOOD_METAR)
     else:
         # Between METAR fetches, still surface the last good obs so the
         # watcher can see obs-age growth and the consensus loop has data.
         metar_by_icao = dict(_LAST_GOOD_METAR)
+    # Fast pull: armed-only ICAO subset, on the armed cadence, only when this
+    # cycle did not already run the full pull (a successful full pull already
+    # covers the armed subset). Empty fast result preserves last-good for those
+    # ICAOs — feed jitter must not erase an observation.
+    if armed_keys and not do_metar and (time.time() - stamp("metar_fast")) >= arm_metar:
+        fast_icaos = sorted(_armed_icaos(armed_keys, cities))
+        if fast_icaos:
+            fast = _fetch_metar(cfg, fast_icaos, now)
+            if fast:
+                metar_by_icao.update(fast)
+                _LAST_GOOD_METAR.update(fast)
+                bump("metar_fast", time.time())
+
+    # 3b) TAF TX/TN — full-universe pull on a slow cadence (TAF updates every
+    # 4-6h; no fast/armed variant needed). Parsed TX/TN per ICAO feed the
+    # strategy's reference-extreme (ref_source="taf") so the reversal fires
+    # relative to the forecast extreme, not the market rank-1 bucket — which
+    # was the cause of the jump=6 misfires (running extreme vs favourite
+    # bucket can be many buckets apart in extreme weather).
+    taf_ttl = float(cfg.get("taf_refresh_interval_seconds", DEFAULTS.get("taf_refresh_interval_seconds", 1800)))
+    do_taf = force_metar or (time.time() - stamp("taf")) >= taf_ttl
+    taf_by_icao: dict[str, dict[str, Any]] = {}
+    if do_taf:
+        fresh_taf = _fetch_taf(cfg, sorted({str(c.get("icao")).upper() for c in cities}), now)
+        if fresh_taf:
+            _LAST_GOOD_TAF.clear()
+            _LAST_GOOD_TAF.update(fresh_taf)
+            bump("taf", time.time())
+        taf_by_icao = dict(_LAST_GOOD_TAF)
+    else:
+        taf_by_icao = dict(_LAST_GOOD_TAF)
 
     # 4+5) Feed strategy per (city,direction) live contract for today
     armed_any = False
@@ -518,6 +649,28 @@ def run_cycle(
         market_unit = city.get("market_unit", "C")
         temp = common.c_to_market_unit(float(obs["temp_c"]), market_unit)
         rule_buckets = rule.get("buckets", [])
+        # TAF reference extreme for this rule: TX for high-direction markets,
+        # TN for low-direction markets. The extreme must fall inside the
+        # market's local calendar date — a TAF spans ~30h and its TX/TN can
+        # belong to the neighbouring local day; using a same-day mismatch
+        # would recreate the jump-misfire bug against a stale reference. When
+        # TAF is missing or off-date we pass None and the strategy falls back
+        # to the market rank-1 consensus reference (allow_market_consensus_reference).
+        taf_extreme_market: float | None = None
+        taf_rec = taf_by_icao.get(icao)
+        if taf_rec is not None:
+            valid_iso = taf_rec.get("tx_valid_utc" if rule.get("direction") == "high" else "tn_valid_utc")
+            taf_c = taf_rec.get("tx_c" if rule.get("direction") == "high" else "tn_c")
+            if valid_iso and taf_c is not None:
+                try:
+                    from zoneinfo import ZoneInfo
+                    tz_name = city.get("timezone") or "UTC"
+                    valid_dt = datetime.fromisoformat(valid_iso.replace("Z", "+00:00"))
+                    local_date = valid_dt.astimezone(ZoneInfo(tz_name)).strftime("%Y-%m-%d")
+                    if local_date == rule.get("market_local_date"):
+                        taf_extreme_market = common.c_to_market_unit(float(taf_c), market_unit)
+                except Exception:  # noqa: BLE001 — bad TAF metadata → None → consensus fallback
+                    taf_extreme_market = None
         # pass all known books for the whole rule (only YES needed for consensus)
         actions = maybe_arm_or_fire(
             state,
@@ -525,7 +678,7 @@ def run_cycle(
             rule.get("market_local_date"),
             rule.get("direction"),
             rule_buckets,
-            None,  # TAF not wired live yet (fallback to consensus reference)
+            taf_extreme_market,  # TAF TX/TN (market units) or None → consensus fallback
             temp,
             obs.get("obs_time"),
             now,
@@ -549,16 +702,30 @@ def run_cycle(
                     tree.setdefault("fired", {})[action["key"]] = {
                         "status": "fired_no_fill", "at_utc": re_execution.iso_utc(now), "jump": action.get("jump"),
                     }
-            elif atype in ("re_skip", "re_skip_yes", "re_disarm"):
-                tbl = {"re_skip": "skip", "re_skip_yes": "skip_yes", "re_disarm": "disarm"}[atype]
-                if atype == "re_disarm":
-                    tree.setdefault("armed", {}).pop(action.get("key"), None)
+                # fire branch complete — never fall through to skip logging
+                continue
+            elif atype in ("re_skip", "re_skip_yes"):
                 # Every skip is recorded (2026-09-03: silent skips hid the
                 # stale_obs deadlock — 0 fires with zero audit trail).
-                log_event(log_path, {"type": tbl, "key": action.get("key"),
-                                     "reason": action.get("reason"),
+                reason = action.get("reason")
+                if reason == "duplicate_obs_time":
+                    # Expected on every fast cycle (no new METAR for that session):
+                    # keep the audit but bound JSONL growth to ~1/key/5 min.
+                    key = action.get("key")
+                    now_f = time.time()
+                    if now_f - _DUP_LOG.get(key, 0.0) < _DUP_LOG_INTERVAL_S:
+                        continue
+                    _DUP_LOG[key] = now_f
+                log_event(log_path, {"type": "skip", "key": action.get("key"),
+                                     "reason": reason,
                                      "jump": action.get("jump"),
                                      "consensus": action.get("consensus")})
+                continue
+            elif atype in ("re_disarm",):
+                # disarm is audit-only; log and move on
+                log_event(log_path, {"type": "disarm", "key": action.get("key"),
+                                     "reason": action.get("reason")})
+                continue
 
     # 6) Passive settlement of resolved positions (best-effort, TTL-gated).
     # Gamma pulls only when open positions exist and settle cadence elapsed.
@@ -626,4 +793,6 @@ def run_cycle(
         "signal_latency_s": {"not_yet_fired": True},
     }
     set_health_extra(tel)
-    return bool(armed_any)
+    # Post-processing truth: fires/disarms/prune this cycle already popped
+    # their sessions, so only sessions still armed keep the caller fast-polling.
+    return bool(tree.get("armed"))

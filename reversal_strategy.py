@@ -91,6 +91,63 @@ def session_key(city_id: str, market_local_date: str, direction: str) -> str:
     return f"{city_id}|{market_local_date}|{direction}"
 
 
+def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], now_utc: datetime | None = None) -> int:
+    """Drop expired armed/fired/running_extremes/last_obs_time session entries.
+
+    Pure, deterministic, never raises; only the four sections above are
+    mutated (taf_forecasts / last_obs / other state content are untouched).
+    A session key has the shape ``city_id|market_local_date|direction`` (see
+    session_key). Three removal rules:
+
+      1. Non-today date: market-local date != the city's local today
+         (cross-day carryover from a previous market day) -> delete.
+      2. Unknown city: city_id no longer present in the registry -> delete
+         (defensive: registration table shrank).
+      3. low zombie (armed only): a ``low`` session whose city local hour is
+         already past LOW_FIRE_LOCAL_HOUR_END — the strategy hour window can
+         never fire it, so the armed entry would pin the run loop to
+         fast-poll forever -> delete.
+
+    Malformed keys (not exactly 3 ``|``-separated parts) are kept as-is, and
+    an unparseable timezone for a known city makes that city's keys skipped,
+    both without raising. Returns the total number of deleted entries.
+    """
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    tree = ensure_re_state(state)
+    by_id = {c.get("city_id"): c for c in cities if c.get("city_id") is not None}
+    removed = 0
+    for section in ("armed", "fired", "running_extremes", "last_obs_time"):
+        section_state = tree.get(section)
+        if not isinstance(section_state, dict):
+            continue
+        for key in list(section_state):
+            parts = key.split("|")
+            if len(parts) != 3:
+                continue  # malformed key — defensive: never delete
+            city_id, market_local_date, direction = parts
+            city = by_id.get(city_id)
+            if city is None:
+                del section_state[key]
+                removed += 1
+                continue
+            tz_name = city.get("timezone")
+            if not isinstance(tz_name, str) or not tz_name:
+                continue  # cannot localize — skip this city, never raise
+            try:
+                local_dt = now_utc.astimezone(ZoneInfo(tz_name))
+            except Exception:
+                continue  # bad tz entry — skip this city, never raise
+            if market_local_date != local_dt.date().isoformat():
+                del section_state[key]
+                removed += 1
+                continue
+            if section == "armed" and direction == "low" and local_dt.hour > LOW_FIRE_LOCAL_HOUR_END:
+                del section_state[key]
+                removed += 1
+    return removed
+
+
 def update_running_extreme(state, city_id, market_local_date, direction, temp: float, now_utc: datetime):
     tree = ensure_re_state(state)
     key = session_key(city_id, market_local_date, direction)
@@ -314,10 +371,44 @@ def maybe_arm_or_fire(
                 "consensus": consensus_meta,
             }]
 
+    # Jump policy: a reversal is a "reference extreme broken by one bucket".
+    # The reference's trustworthiness decides how much jump slack we allow:
+    #   - TAF TX/TN reference (ref_source="taf"): forecast extreme is
+    #     independent of the market, so a 2-bucket breach is a rare genuine
+    #     signal worth taking (NO-only).
+    #   - Market rank-1 consensus reference (ref_source="market_rank1"):
+    #     the reference IS the market's favourite bucket, so a large jump is
+    #     usually the favourite being wrong / thin books, not an edge — the
+    #     2026-09-05 jump=6 misfires (buenos-aires/qingdao/chicago) all came
+    #     from this path. Fire only at exactly max_consensus_jump (1 bucket)
+    #     when the reference is market-derived; anything larger is noise and
+    #     is skipped outright (no NO-only fire either).
+    max_consensus_jump = int(cfg.get("max_consensus_jump", MAX_BUCKET_JUMP))
     if jump > max_jump:
+        if ref_source != "taf":
+            # market-consensus reference with an oversized jump → not an edge.
+            # Mark fired so the session doesn't re-arm and re-alert every tick.
+            tree["fired"][key] = {
+                "status": "fired_no_fill", "at_utc": iso_utc(now_utc), "jump": jump,
+                "ref_source": ref_source, "reason": "jump_too_large_for_ref",
+            }
+            tree["armed"].pop(key, None)
+            return [{"action_type": "re_skip", "reason": "jump_too_large_for_ref", "key": key,
+                     "jump": jump, "ref_source": ref_source}]
         actions.append({"action_type": "re_skip_yes", "reason": "jump_gt_one", "key": key, "jump": jump})
         fire_yes = False
         new_b = None
+    elif jump > max_consensus_jump and ref_source != "taf":
+        # same guard for the (jump <= max_jump but still > market-only cap)
+        # case — unreachable while max_consensus_jump == max_jump, kept for
+        # configurability if the TAF cap is later widened.
+        tree["fired"][key] = {
+            "status": "fired_no_fill", "at_utc": iso_utc(now_utc), "jump": jump,
+            "ref_source": ref_source, "reason": "jump_too_large_for_ref",
+        }
+        tree["armed"].pop(key, None)
+        return [{"action_type": "re_skip", "reason": "jump_too_large_for_ref", "key": key,
+                 "jump": jump, "ref_source": ref_source}]
     else:
         fire_yes = bool(cfg.get("yes_leg_enabled", True))
         new_b = run_b if jump == 1 else None
