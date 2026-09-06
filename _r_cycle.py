@@ -30,14 +30,19 @@ from typing import Any
 
 import market_adapter
 import re_execution
+import sleeve_signal
 from _r_exec import settle_markets
 from _r_globals import book_cache, bump, clob, set_health_extra, stamp, tracker
 from _r_state import DEFAULTS, log_event
 from adapters.polymarket.orderbook import from_any
-from paper_capital import reserve
+from paper_capital import release, reserve
 from research import common
 from reversal_strategy import ensure_re_state, maybe_arm_or_fire, prune_stale_sessions
 from ws_bridge import ws_bridge
+
+# B2 pre-breach sleeve: process-lifetime price ring + per-key entered set so a
+# session only sleeves once (dedupe against the WS book ticking every cycle).
+_SLEEVE_RING = sleeve_signal.PriceRing(window_s=900.0)
 
 LOG_FIELDS = None
 ZERO = Decimal("0")
@@ -480,6 +485,198 @@ def _armed_icaos(armed_keys: set[str], cities: list[dict[str, Any]]) -> set[str]
 
 
 # --------------------------------------------------------------------------- #
+# B2 sleeve helpers (paper entry path, shares the capped-FAK fire window)
+# --------------------------------------------------------------------------- #
+def action_key_in_tree(tree: dict[str, Any], rule: dict[str, Any]) -> bool:
+    """True when the session already fired (breach happened) — no sleeve on a
+    done deal."""
+    return rule.get("key") in tree.get("fired", {})
+
+
+def _sleeve_enter_ok(state: dict[str, Any], rule: dict[str, Any]) -> bool:
+    """Dedupe: one sleeve entry per session, tracked on state (survives
+    restart, unlike an in-memory set)."""
+    sleeves = state.setdefault("weatherbotyes2re", {}).setdefault("sleeves", {})
+    return rule.get("key") not in sleeves
+
+
+def _enter_sleeve(
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    rule: dict[str, Any],
+    buckets: list[dict[str, Any]],
+    n_idx: int,
+    sig: sleeve_signal.SleeveSignal,
+    now_utc: datetime,
+) -> None:
+    """Build a sleeve fire (single neighbour-YES leg, small budget) and run it
+    through the shared paper fire window. Key is \"<session>#sleeve\" so the
+    position ledger never collides with the main reversal position."""
+    try:
+        ordered = sorted(buckets, key=lambda b: float(b.get("lo") if b.get("lo") is not None else float("-inf")))
+        if not (0 <= n_idx < len(ordered)):
+            return
+        nbr = ordered[n_idx]
+        yes_tok = str(nbr.get("yes_token_id") or "")
+        bucket_id = str(nbr.get("bucket_id") or nbr.get("id") or "")
+        if not yes_tok:
+            return
+        sleeve_cfg = cfg.get("strategy") or {}
+        max_ask = str(sleeve_cfg.get("sleeve_max_ask", 0.35))
+        sleeve_key = f"{rule['key']}#sleeve"
+        fire: dict[str, Any] = {
+            "action_type": "re_sleeve",
+            "key": sleeve_key,
+            "city_id": rule.get("city_id"),
+            "icao": rule.get("icao"),
+            "market_local_date": rule.get("market_local_date"),
+            "direction": rule.get("direction"),
+            "sleeve": True,
+            "sleeve_signal_reason": sig.reason,
+            "ref_source": "book_structure",
+            "jump": 0,
+            "legs": [
+                {
+                    "leg": "buy_yes_sleeve",
+                    "token_id": yes_tok,
+                    "side": "BUY",
+                    "outcome": "YES",
+                    "cap": max_ask,
+                    "notional_pct": "1.0",
+                }
+            ],
+            "new_bucket_id": bucket_id,
+        }
+        position, ladlog = _paper_fire(cfg, state, fire, now_utc)
+        if position is not None:
+            pos = state.setdefault("positions", {})
+            pos[sleeve_key] = position
+            tree2 = state.setdefault("weatherbotyes2re", {})
+            tree2.setdefault("sleeves", {})[rule["key"]] = {
+                "entered_at_utc": re_execution.iso_utc(now_utc),
+                "bucket_id": bucket_id,
+                "token_id": yes_tok,
+                "status": "open",
+            }
+            log_event(
+                cfg.get("log_path"),
+                {
+                    "type": "sleeve_entered",
+                    "key": sleeve_key,
+                    "session_key": rule["key"],
+                    "bucket_id": bucket_id,
+                    "reason": sig.reason,
+                    "fills": {
+                        str(lg.get("leg")): {"shares": lg.get("shares"), "cost": lg.get("cost_usdc")}
+                        for lg in (position.get("legs") or [])
+                    },
+                    "ts_utc": now_utc.isoformat(),
+                },
+            )
+        else:
+            # nothing fillable — record intent so we don't retry every cycle
+            tree2 = state.setdefault("weatherbotyes2re", {})
+            tree2.setdefault("sleeves", {})[rule["key"]] = {
+                "entered_at_utc": re_execution.iso_utc(now_utc),
+                "bucket_id": bucket_id,
+                "token_id": yes_tok,
+                "status": "no_fill",
+            }
+    except Exception as exc:  # noqa: BLE001
+        log_event(cfg.get("log_path"), {"type": "sleeve_error", "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _expire_stale_sleeves(cfg: dict[str, Any], state: dict[str, Any], now_utc: datetime) -> None:
+    """Time out pre-breach sleeves whose session never fired.
+
+    A sleeve is a bet that the market's book rotation is *information* (a new
+    obs is about to confirm a breach). If the session has not fired within
+    ``sleeve_timeout_s`` the move was sentiment churn — close the sleeve at the
+    current book to stop the bleed. Paper close: sell shares at best_bid
+    (release proceeds back to the pool); if no bid exists the leg is written
+    off at full cost (like a losing settlement)."""
+    tree = state.setdefault("weatherbotyes2re", {})
+    sleeves = tree.get("sleeves", {})
+    if not sleeves:
+        return
+    sleeve_cfg = cfg.get("strategy") or {}
+    timeout_s = float(sleeve_cfg.get("sleeve_timeout_s", 1800))
+    cache = book_cache()
+    positions = state.setdefault("positions", {})
+    now_epoch = time.time()
+    for sess_key, rec in list(sleeves.items()):
+        if rec.get("status") != "open":
+            continue
+        # Session fired -> the sleeve was validated (its neighbour YES either
+        # won or will resolve normally). Leave it to passive settlement.
+        if sess_key in tree.get("fired", {}):
+            rec["status"] = "validated_by_breach"
+            rec["validated_at_utc"] = re_execution.iso_utc(now_utc)
+            continue
+        try:
+            entered = datetime.fromisoformat(str(rec.get("entered_at_utc", "")).replace("Z", "+00:00"))
+            age_s = (now_utc - entered).total_seconds()
+        except Exception:  # noqa: BLE001
+            age_s = 0.0
+        if age_s < timeout_s:
+            continue
+        # Timeout: close the sleeve position leg at current best bid.
+        pos_key = f"{sess_key}#sleeve"
+        pos = positions.get(pos_key)
+        if pos is None or pos.get("settled"):
+            rec["status"] = "expired_no_position"
+            continue
+        leg = None
+        for lg in pos.get("legs", []):
+            if not lg.get("settled"):
+                leg = lg
+                break
+        if leg is None:
+            rec["status"] = "expired_no_leg"
+            continue
+        tok = str(leg.get("token_id") or "")
+        book = cache.get(tok) if tok else None
+        bid = None
+        if book:
+            bid = book.get("best_bid")
+        shares = Decimal(str(leg.get("shares") or 0))
+        proceeds = ZERO
+        if bid is not None and shares > ZERO:
+            try:
+                proceeds = (Decimal(str(bid)) * shares).quantize(Decimal("0.0001"))
+            except Exception:  # noqa: BLE001
+                proceeds = ZERO
+        if proceeds > ZERO:
+            release(state, proceeds)
+        # Mark leg settled (loss = cost minus proceeds; cost already debited).
+        leg["settled"] = True
+        leg["leg_won"] = False
+        leg["closed_by"] = "sleeve_timeout"
+        leg["sleeve_close_proceeds_usdc"] = str(proceeds)
+        leg["settled_at_utc"] = re_execution.iso_utc(now_utc)
+        if all(lg.get("settled") for lg in pos.get("legs", [])):
+            pos["settled"] = True
+            pos["settled_at_utc"] = re_execution.iso_utc(now_utc)
+        rec["status"] = "expired"
+        rec["expired_at_utc"] = re_execution.iso_utc(now_utc)
+        rec["close_proceeds_usdc"] = str(proceeds)
+        rec["bid_at_close"] = str(bid) if bid is not None else None
+        log_event(
+            cfg.get("log_path"),
+            {
+                "type": "sleeve_timeout",
+                "session_key": sess_key,
+                "position_key": pos_key,
+                "age_s": round(age_s, 1),
+                "shares": str(shares),
+                "proceeds_usdc": str(proceeds),
+                "bid_at_close": str(bid) if bid is not None else None,
+                "ts_utc": now_utc.isoformat(),
+            },
+        )
+
+
+# --------------------------------------------------------------------------- #
 # Fire (paper) window
 # --------------------------------------------------------------------------- #
 def _paper_fire(
@@ -494,7 +691,14 @@ def _paper_fire(
     ladder cache, reserving real paper cash and recording the position on the
     state blob. Returns (position_legs_or_None, ladder_log)."""
     cache = book_cache()
-    budget = Decimal(str(cfg.get("fire_budget_usdc", DEFAULTS["fire_budget_usdc"])))
+    is_sleeve = bool(fire.get("sleeve"))
+    if is_sleeve:
+        # B2 pre-breach sleeve: a small fraction of the fire budget on a single
+        # neighbour-YES leg. budget is fire_budget × sleeve_notional_pct.
+        pct = Decimal(str(fire.get("sleeve_notional_pct") or cfg.get("sleeve_notional_pct", 0.08)))
+        budget = (Decimal(str(cfg.get("fire_budget_usdc", DEFAULTS["fire_budget_usdc"]))) * pct).quantize(Decimal("0.01"))
+    else:
+        budget = Decimal(str(cfg.get("fire_budget_usdc", DEFAULTS["fire_budget_usdc"])))
     remaining = re_execution.size_legs(fire, budget)
     fills: dict[str, dict[str, Any]] = {}
     ladlog: list[dict[str, Any]] = []
@@ -557,6 +761,7 @@ def _paper_fire(
 
     position = {
         "key": fire["key"],
+        "kind": "sleeve" if is_sleeve else "reversal",
         "city_id": fire.get("city_id"),
         "icao": fire.get("icao"),
         "market_local_date": fire.get("market_local_date"),
@@ -595,7 +800,7 @@ def _paper_fire(
         name = str(leg["leg"])
         if name == "buy_no_broken":
             bucket_id = fire.get("broken_bucket_id")
-        elif name == "buy_yes_new":
+        elif name in ("buy_yes_new", "buy_yes_sleeve"):
             bucket_id = fire.get("new_bucket_id")
         else:
             continue
@@ -855,11 +1060,10 @@ def run_cycle(
         # Build per-rule book map for the YES tokens that have addresses
         rule_books: dict[str, dict[str, Any]] = {}
         for b in rule.get("buckets", []):
-            yes = str(b.get("yes_token_id") or "")
-            if yes and yes in cache:
-                rule_books[yes] = cache[yes]
-            else:
-                rule_books[yes] = {}
+            for side in ("yes_token_id", "no_token_id"):
+                tok = str(b.get(side) or "")
+                if tok and tok in cache:
+                    rule_books[tok] = cache[tok]
         # sample consensus even without new METAR (book cadence ~30s)
         t = tracker()
         t.record_books(
@@ -870,6 +1074,45 @@ def run_cycle(
             rule_books,
             now,
         )
+
+        # ---- B2 pre-breach sleeve (pure book structure, no METAR). ----
+        # While enabled, keep the price ring fed and look for the rank-1 YES
+        # weakening + neighbour YES strengthening that says the market is
+        # pricing a breach before the obs reaches us. On signal we enter a
+        # SMALL neighbour-YES sleeve (budget = fire_budget × sleeve_notional_pct,
+        # ask cap = sleeve_max_ask). Sleeve positions carry key "<session>#sleeve"
+        # so they never collide with the main reversal position of the same
+        # session, and kind="sleeve" so the reports can separate the A/B arm.
+        sleeve_cfg = cfg.get("strategy") or {}
+        if sleeve_cfg.get("sleeve_enabled") and rule_books:
+            srule = rule.get("buckets") or []
+            if srule:
+                now_e = time.time()
+                sleeve_signal.update_rings_from_books(_SLEEVE_RING, srule, rule_books, now_e)
+                # skip fired sessions (breach already happened) and dedupe
+                session_fired = action_key_in_tree(tree, rule)
+                r1_idx = sleeve_signal.locate_rank1_bucket(srule, rule_books, _SLEEVE_RING, now_e)
+                if not session_fired and r1_idx is not None and _sleeve_enter_ok(state, rule):
+                    det = sleeve_signal.detect_sleeve_signal(
+                        buckets=srule,
+                        rank1_bucket_idx=r1_idx,
+                        direction=rule.get("direction", "high"),
+                        books_by_token=rule_books,
+                        ring=_SLEEVE_RING,
+                        now=now_e,
+                        short_window_s=float(sleeve_cfg.get("sleeve_short_window_s", 150)),
+                        long_window_s=float(sleeve_cfg.get("sleeve_long_window_s", 600)),
+                        rank1_weaken_drop=Decimal(str(sleeve_cfg.get("sleeve_rank1_drop", 0.05))),
+                        neighbour_strengthen_rise=Decimal(str(sleeve_cfg.get("sleeve_neighbour_rise", 0.04))),
+                        neighbour_max_ask=Decimal(str(sleeve_cfg.get("sleeve_max_ask", 0.35))),
+                    )
+                    if det is not None:
+                        n_idx, sig = det
+                        sig.key = rule["key"]
+                        sig.city_id = rule.get("city_id", "")
+                        sig.market_local_date = rule.get("market_local_date", "")
+                        log_event(log_path, sig.as_event(now.isoformat()))
+                        _enter_sleeve(cfg, state, rule, srule, n_idx, sig, now)
         icao = city_by_id.get(rule.get("city_id"), {}).get("icao", "").upper()
         obs = metar_by_icao.get(icao)
         if obs is None or obs.get("temp_c") is None:
@@ -957,6 +1200,14 @@ def run_cycle(
                 log_event(log_path, {"type": "disarm", "key": action.get("key"),
                                      "reason": action.get("reason")})
                 continue
+
+    # 5b) B2 sleeve timeout: a pre-breach sleeve that has not been validated by
+    # a real breach (i.e. its session has not fired) within sleeve_timeout_s is
+    # sentiment churn, not information. Sell it at the current book (paper:
+    # mark the leg cost as a sleeve_timeout loss) so a rotating book cannot
+    # bleed the small sleeve allocation indefinitely. Real breaches settle via
+    # the normal passive settlement below (win/lose at resolution).
+    _expire_stale_sleeves(cfg, state, now)
 
     # 6) Passive settlement of resolved positions (best-effort, TTL-gated).
     # Gamma pulls only when open positions exist and settle cadence elapsed.

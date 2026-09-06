@@ -36,7 +36,16 @@
     "fast_poll_seconds": 8,
     "fire_budget_ms": 8000,
     "max_obs_lookback_seconds": 5400,
-    "max_obs_future_seconds": 900
+    "max_obs_future_seconds": 900,
+    "sleeve_enabled": false,
+    "sleeve_notional_pct": 0.08,
+    "sleeve_max_ask": 0.35,
+    "sleeve_rank1_drop": 0.05,
+    "sleeve_neighbour_rise": 0.04,
+    "sleeve_short_window_s": 150,
+    "sleeve_long_window_s": 600,
+    "sleeve_timeout_s": 1800,
+    "sleeve_min_ticks": 4
   },
   "settle_poll_seconds": 60,
   "ws_triggered_metar_enabled": true
