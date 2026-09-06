@@ -112,6 +112,28 @@ def scenario_two_bucket_yes_skipped():
             "ok":fire is not None and "buy_yes_new" in legs and "buy_no_broken" not in legs}
 
 
+def scenario_stale_market_date():
+    # 2026-09-06 regression: chicago|2026-09-05|low at 05:00Z (local midnight
+    # rollover). prune deletes yesterday's fired marker every cycle, but the
+    # TTL'd rules cache still lists the 09-05 rule — the same breach obs
+    # re-fires every cycle (~$230/min burn). Guard: market_local_date that is
+    # no longer the city's local today must skip, never arm/fire.
+    state={}
+    city={"city_id":"chicago","icao":"KORD","timezone":"America/Chicago"}
+    buckets=make_buckets()
+    # 2026-09-06 05:00Z == 2026-09-05 23:00-24:00 CDT... 05:00Z CDT = 00:00 (CDT=UTC-5),
+    # so local date is ALREADY 09-06 while the market rule is dated 09-05.
+    now=datetime(2026,9,6,5,0,tzinfo=timezone.utc)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-05", "low", "h30", now)
+    # low direction breach: obs 20.0 vs ref 21.0 (jump into h20)
+    actions=maybe_arm_or_fire(state, city, "2026-09-05", "low", buckets, 21.0, 20.0, now, now, {}, PAPER_CFG, tracker)
+    types=[a["action_type"] for a in actions]
+    return {"name":"stale_market_date","types":types,
+            "ok":"re_fire" not in types and "re_arm" not in types and
+                 any(a.get("reason")=="stale_market_date" for a in actions)}
+
+
 def scenario_stale_obs_no_fire():
     # 2026-09-03 window semantics: stale = obs older than 90 min (was 180 s).
     # 10-min-old obs is a NORMAL hourly-cadence gap and must be able to fire.
@@ -224,6 +246,7 @@ def run_scenarios():
         scenario_no_double_fire,
         scenario_consensus_blocks_non_leader,
         scenario_prune_stale,
+        scenario_stale_market_date,
     ):
         r=fn(); results.append(r)
         if not r.get("ok"): failed += 1

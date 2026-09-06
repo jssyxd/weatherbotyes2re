@@ -500,6 +500,52 @@ def _sleeve_enter_ok(state: dict[str, Any], rule: dict[str, Any]) -> bool:
     return rule.get("key") not in sleeves
 
 
+def _sleeve_tick(
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    rule: dict[str, Any],
+    rule_books: dict[str, dict[str, Any]],
+    tree: dict[str, Any],
+    now_utc: datetime,
+) -> None:
+    """One B2 detection tick for a single (today-dated) rule: feed the price
+    ring from current books, locate the rank-1 bucket, and on a structure
+    signal enter a small sleeve via the shared paper window."""
+    srule = rule.get("buckets") or []
+    if not srule:
+        return
+    try:
+        now_e = time.time()
+        sleeve_signal.update_rings_from_books(_SLEEVE_RING, srule, rule_books, now_e)
+        session_fired = action_key_in_tree(tree, rule)
+        r1_idx = sleeve_signal.locate_rank1_bucket(srule, rule_books, _SLEEVE_RING, now_e)
+        if session_fired or r1_idx is None or not _sleeve_enter_ok(state, rule):
+            return
+        sleeve_cfg = cfg.get("strategy") or {}
+        det = sleeve_signal.detect_sleeve_signal(
+            buckets=srule,
+            rank1_bucket_idx=r1_idx,
+            direction=rule.get("direction", "high"),
+            books_by_token=rule_books,
+            ring=_SLEEVE_RING,
+            now=now_e,
+            short_window_s=float(sleeve_cfg.get("sleeve_short_window_s", 150)),
+            long_window_s=float(sleeve_cfg.get("sleeve_long_window_s", 600)),
+            rank1_weaken_drop=Decimal(str(sleeve_cfg.get("sleeve_rank1_drop", 0.05))),
+            neighbour_strengthen_rise=Decimal(str(sleeve_cfg.get("sleeve_neighbour_rise", 0.04))),
+            neighbour_max_ask=Decimal(str(sleeve_cfg.get("sleeve_max_ask", 0.35))),
+        )
+        if det is not None:
+            n_idx, sig = det
+            sig.key = rule["key"]
+            sig.city_id = rule.get("city_id", "")
+            sig.market_local_date = rule.get("market_local_date", "")
+            log_event(cfg.get("log_path"), sig.as_event(now_utc.isoformat()))
+            _enter_sleeve(cfg, state, rule, srule, n_idx, sig, now_utc)
+    except Exception as exc:  # noqa: BLE001
+        log_event(cfg.get("log_path"), {"type": "sleeve_tick_error", "error": f"{type(exc).__name__}: {exc}"})
+
+
 def _enter_sleeve(
     cfg: dict[str, Any],
     state: dict[str, Any],
@@ -1087,32 +1133,20 @@ def run_cycle(
         if sleeve_cfg.get("sleeve_enabled") and rule_books:
             srule = rule.get("buckets") or []
             if srule:
-                now_e = time.time()
-                sleeve_signal.update_rings_from_books(_SLEEVE_RING, srule, rule_books, now_e)
-                # skip fired sessions (breach already happened) and dedupe
-                session_fired = action_key_in_tree(tree, rule)
-                r1_idx = sleeve_signal.locate_rank1_bucket(srule, rule_books, _SLEEVE_RING, now_e)
-                if not session_fired and r1_idx is not None and _sleeve_enter_ok(state, rule):
-                    det = sleeve_signal.detect_sleeve_signal(
-                        buckets=srule,
-                        rank1_bucket_idx=r1_idx,
-                        direction=rule.get("direction", "high"),
-                        books_by_token=rule_books,
-                        ring=_SLEEVE_RING,
-                        now=now_e,
-                        short_window_s=float(sleeve_cfg.get("sleeve_short_window_s", 150)),
-                        long_window_s=float(sleeve_cfg.get("sleeve_long_window_s", 600)),
-                        rank1_weaken_drop=Decimal(str(sleeve_cfg.get("sleeve_rank1_drop", 0.05))),
-                        neighbour_strengthen_rise=Decimal(str(sleeve_cfg.get("sleeve_neighbour_rise", 0.04))),
-                        neighbour_max_ask=Decimal(str(sleeve_cfg.get("sleeve_max_ask", 0.35))),
-                    )
-                    if det is not None:
-                        n_idx, sig = det
-                        sig.key = rule["key"]
-                        sig.city_id = rule.get("city_id", "")
-                        sig.market_local_date = rule.get("market_local_date", "")
-                        log_event(log_path, sig.as_event(now.isoformat()))
-                        _enter_sleeve(cfg, state, rule, srule, n_idx, sig, now)
+                # Cross-midnight guard (same incident as reversal_strategy):
+                # never sleeve a session whose market local date is not today.
+                city_tz = city_by_id.get(rule.get("city_id"), {}).get("timezone") or "UTC"
+                try:
+                    rl_today = rule.get("market_local_date")
+                    local_today = now.astimezone(ZoneInfo(city_tz)).date().isoformat()
+                    if rl_today and rl_today != local_today:
+                        # stale-date rule: skip sleeve (still feed ring below is
+                        # pointless for a dead session — skip entirely)
+                        pass
+                    else:
+                        _sleeve_tick(cfg, state, rule, rule_books, tree, now)
+                except Exception:  # noqa: BLE001 — bad tz: fall back to running sleeve
+                    _sleeve_tick(cfg, state, rule, rule_books, tree, now)
         icao = city_by_id.get(rule.get("city_id"), {}).get("icao", "").upper()
         obs = metar_by_icao.get(icao)
         if obs is None or obs.get("temp_c") is None:

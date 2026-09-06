@@ -249,6 +249,21 @@ def maybe_arm_or_fire(
     tree = ensure_re_state(state)
     key = session_key(city["city_id"], market_local_date, direction)
 
+    # Cross-midnight date guard (2026-09-06 incident): a session whose market
+    # local date is no longer the city's local TODAY must never arm/fire. When
+    # a market day rolls over (e.g. chicago 09-05 -> 09-06 at 05:00Z), prune
+    # deletes yesterday's fired marker every cycle but the rules cache (TTL'd)
+    # still lists the old-date rule — so the same breach observation re-fires
+    # on every cycle (~$230/min paper burn on both A/B arms). Skipping stale
+    # dates here closes the loop: prune keeps cleaning, nothing re-fires.
+    try:
+        city_tz = city.get("timezone") or "UTC"
+        local_today = now_utc.astimezone(ZoneInfo(city_tz)).date().isoformat()
+    except Exception:  # noqa: BLE001 — bad tz: fall through to normal checks
+        local_today = market_local_date
+    if market_local_date != local_today:
+        return [{"action_type": "re_skip", "reason": "stale_market_date", "key": key}]
+
     # Continuous consensus sampling (even before break)
     tracker.record_books(
         city["city_id"],
