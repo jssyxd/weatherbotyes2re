@@ -2,7 +2,7 @@
   "mode": "paper",
   "scan_interval_seconds": 20,
   "fast_poll_interval_seconds": 5,
-  "idle_metar_interval_seconds": 60,
+  "idle_metar_interval_seconds": 30,
   "arm_metar_interval_seconds": 5,
   "idle_book_interval_seconds": 30,
   "rules_refresh_interval_seconds": 1200,
@@ -38,5 +38,6 @@
     "max_obs_lookback_seconds": 5400,
     "max_obs_future_seconds": 900
   },
-  "settle_poll_seconds": 60
+  "settle_poll_seconds": 60,
+  "ws_triggered_metar_enabled": true
 }

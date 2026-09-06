@@ -234,6 +234,34 @@ def _warm_tokens_for_rules(rules: dict[str, Any], state: dict[str, Any]) -> list
     return warm
 
 
+def _warm_token_icao_map(
+    rules: dict[str, Any],
+    cities: list[dict[str, Any]],
+    armed_keys: set[str] | None = None,
+) -> dict[str, str]:
+    """Reverse map token id -> station ICAO for the armed rules' buckets.
+
+    Iterates every rule bucket (YES/NO token ids) and maps the owning rule's
+    ``city_id`` (first segment of the rule key) to its ICAO via ``cities``.
+    Used by the R1 early-pull to know which METAR station to fetch when a
+    fire-critical token's WS book reprices."""
+    city_by_id = {str(c.get("city_id")): c for c in cities if c.get("city_id") is not None}
+    out: dict[str, str] = {}
+    for key, rule in (rules or {}).items():
+        if armed_keys is not None and key not in armed_keys:
+            continue
+        city = city_by_id.get(str(key).split("|", 1)[0])
+        if city is None:
+            continue
+        icao = str(city.get("icao")).upper()
+        for b in rule.get("buckets", []) or []:
+            for side in ("yes_token_id", "no_token_id"):
+                tok = str(b.get(side) or "")
+                if tok:
+                    out[tok] = icao
+    return out
+
+
 def _normalize_snapshot(token_id: str, snapshot: Any) -> dict[str, Any] | None:
     """Turn any CLOB/WS book snapshot into the pure ladder-dict the strategy
     and ``paper_match_fak`` were written against:
@@ -306,9 +334,57 @@ def _ws_pump(wsb: Any, cache: dict[str, Any], max_age_s: float = 5.0) -> int:
     return n
 
 
+# WS-triggered METAR pull (R1): when an armed session's fire-critical token
+# sees a live WS book update (the market repriced = someone likely read a new
+# obs we have not pulled yet), pull that ICAO's METAR immediately instead of
+# waiting for the next armed 5s cadence. Cooldown per ICAO prevents request
+# storms from a churning book.
+_WS_METAR_COOLDOWN: dict[str, float] = {}
+_WS_METAR_COOLDOWN_S = 3.0
+
+
+def _recent_ws_tokens(wsb: Any, max_age_s: float = 4.0) -> set[str]:
+    """Token ids whose WS LocalOrderBook received an update within max_age_s.
+
+    Used by the R1 early-pull: a fresh WS tick on a fire-critical token means
+    the market repriced — pull the underlying obs now, don't wait for the
+    5s armed cadence (mirror-lag reduction: we are not the last reader of a
+    published METAR, but we can stop being the *second*-last)."""
+    stream = getattr(wsb, "stream", None)
+    if stream is None:
+        return set()
+    now_e = time.time()
+    out: set[str] = set()
+    for tid, lb in list(stream.books.items()):
+        try:
+            if getattr(lb, "received_at_epoch", 0.0) > 0 and (now_e - lb.received_at_epoch) <= max_age_s:
+                out.add(str(tid))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # METAR
 # --------------------------------------------------------------------------- #
+def _metar_age_s(obs: dict[str, Any], now_utc: datetime | None = None) -> float:
+    """Age of a METAR obs dict (its ``obs_time`` ISO field) in seconds from
+    now. Returns -1 when the obs has no parseable timestamp (caller treats as
+    unknown age rather than a misleading 0)."""
+    raw = obs.get("obs_time") or obs.get("obs_dt")
+    if not raw:
+        return -1.0
+    try:
+        if isinstance(raw, datetime):
+            dt = raw
+        else:
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        base = now_utc if now_utc is not None else datetime.now(timezone.utc)
+        return max(0.0, (base - dt).total_seconds())
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
 def _fetch_metar(
     cfg: dict[str, Any],
     icaos: list[str],
@@ -662,6 +738,34 @@ def run_cycle(
         _ws_pump(wsb, cache)
     ws_tel = wsb.telemetry()
 
+    # 2b) R1 — WS-triggered METAR early pull. If a fire-critical token's WS
+    # book just repriced (fresh tick within ~4s) while its session is armed,
+    # the market likely already read a new obs we have not pulled yet. Pull
+    # that ICAO's METAR immediately (dual-source) instead of waiting for the
+    # armed cadence, with a per-ICAO cooldown so a churning book cannot storm
+    # the feed. The pulled obs is merged into metar_by_icao below so the
+    # strategy sees it this very cycle.
+    _ws_touched_icaos: set[str] = set()
+    r1_enabled = bool(cfg.get("ws_triggered_metar_enabled", True))
+    if r1_enabled and armed_keys and wsb.running:
+        try:
+            recent = _recent_ws_tokens(wsb, max_age_s=4.0)
+            if recent:
+                # Reverse-map token -> ICAO via the rules' bucket token ids.
+                icao_by_tok = _warm_token_icao_map(rules_idx, cities, armed_keys)
+                now_e2 = time.time()
+                for tok in recent:
+                    icao = icao_by_tok.get(str(tok))
+                    if not icao:
+                        continue
+                    last = _WS_METAR_COOLDOWN.get(icao, 0.0)
+                    if (now_e2 - last) < _WS_METAR_COOLDOWN_S:
+                        continue
+                    _WS_METAR_COOLDOWN[icao] = now_e2
+                    _ws_touched_icaos.add(icao)
+        except Exception as exc:  # noqa: BLE001
+            log_event(log_path, {"type": "ws_trigger_failed", "error": f"{type(exc).__name__}: {exc}"})
+
     # 3) METAR — dual-rate pulls.
     # Full universe still runs on the idle cadence (stamp "metar", ~60s) and
     # feeds consensus + every rule. While any session is armed, a fast subset
@@ -702,6 +806,28 @@ def run_cycle(
                 metar_by_icao.update(fast)
                 _LAST_GOOD_METAR.update(fast)
                 bump("metar_fast", time.time())
+    # R1 early pull: WS-triggered ICAOs (market repriced on a fire-critical
+    # token while armed). Pull them immediately regardless of cadence stamps —
+    # this is the mirror-lag reduction: the book moved because someone read a
+    # fresh obs; we want it in THIS cycle, not at the next 5s beat. A failed
+    # pull keeps last-good and the cooldown handles retry pacing.
+    if _ws_touched_icaos and not do_metar:
+        _ws_touched_icaos = {i.upper() for i in _ws_touched_icaos}
+        _ws_touched_icaos -= set(metar_by_icao)  # full pull already covered it
+        if _ws_touched_icaos:
+            trig = _fetch_metar(cfg, sorted(_ws_touched_icaos), now)
+            if trig:
+                metar_by_icao.update(trig)
+                _LAST_GOOD_METAR.update(trig)
+                log_event(
+                    log_path,
+                    {
+                        "type": "ws_triggered_metar",
+                        "icaos": sorted(_ws_touched_icaos),
+                        "obs_ages": {i: _metar_age_s(trig[i]) for i in sorted(_ws_touched_icaos) if i in trig},
+                        "ts_utc": now.isoformat(),
+                    },
+                )
 
     # 3b) TAF TX/TN — full-universe pull on a slow cadence (TAF updates every
     # 4-6h; no fast/armed variant needed). Parsed TX/TN per ICAO feed the
