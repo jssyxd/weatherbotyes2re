@@ -121,7 +121,7 @@ def scenario_stale_market_date():
     state={}
     city={"city_id":"chicago","icao":"KORD","timezone":"America/Chicago"}
     buckets=make_buckets()
-    # 2026-09-06 05:00Z == 2026-09-05 23:00-24:00 CDT... 05:00Z CDT = 00:00 (CDT=UTC-5),
+    # 2026-09-06 05:00Z CDT = 00:00 (CDT=UTC-5),
     # so local date is ALREADY 09-06 while the market rule is dated 09-05.
     now=datetime(2026,9,6,5,0,tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
@@ -132,6 +132,77 @@ def scenario_stale_market_date():
     return {"name":"stale_market_date","types":types,
             "ok":"re_fire" not in types and "re_arm" not in types and
                  any(a.get("reason")=="stale_market_date" for a in actions)}
+
+
+def scenario_tz_unresolvable_fail_closed():
+    # 2026-09-06 guard hardening: the date guard must FAIL CLOSED when the
+    # city's timezone is missing or unparseable — "today" cannot be verified,
+    # so arm/fire are refused. (The hotfix's except branch set local_today =
+    # market_local_date, silently disabling the guard — a breach would fire
+    # on any city whose tz entry broke, re-opening the stale-date burn.)
+    state={}
+    city={"city_id":"chicago","icao":"KORD","timezone":"Not/AZone"}  # unparseable tz
+    buckets=make_buckets()
+    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
+    types=[a["action_type"] for a in actions]
+    reasons=[a.get("reason") for a in actions]
+    guards=[a.get("guard") for a in actions]
+    return {"name":"tz_unresolvable_fail_closed","types":types,"reasons":reasons,"guards":guards,
+            "ok":"re_arm" not in types and "re_fire" not in types and
+                 any(a.get("reason")=="stale_market_date" for a in actions)}
+
+
+def scenario_missing_tz_fail_closed():
+    # Same fail-closed contract for a city with NO timezone field at all.
+    state={}
+    city={"city_id":"chicago","icao":"KORD"}  # timezone missing
+    buckets=make_buckets()
+    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
+    types=[a["action_type"] for a in actions]
+    return {"name":"missing_tz_fail_closed","types":types,
+            "ok":"re_arm" not in types and "re_fire" not in types and
+                 any(a.get("reason")=="stale_market_date" for a in actions)}
+
+
+def scenario_prune_keeps_open_fired():
+    # 2026-09-06 root fix (part 2): prune must NOT delete a stale-date fired
+    # marker while that session's own paper position is still open — the marker
+    # is the one-fire dedupe credential and a stale rule from the TTL'd cache
+    # would otherwise re-fire the same breach obs every cycle. Once the
+    # position settles the marker becomes prunable again.
+    city = make_city()
+    city["timezone"] = "UTC"
+    now = datetime(2026, 9, 5, 15, 0, tzinfo=timezone.utc)  # local date 2026-09-05
+    stale_open = "shanghai|2026-09-04|high"     # stale date, position OPEN  -> keep fired
+    stale_done = "shanghai|2026-09-04|low"      # stale date, position settled -> prune
+    today_key = "shanghai|2026-09-05|high"      # today -> keep
+    state = {
+        "positions": {
+            stale_open: {"settled": False},
+            stale_done: {"settled": True},
+            today_key: {"settled": False},
+        },
+        "weatherbotyes2re": {
+            "armed": {},
+            "fired": {stale_open: {"status": "fired"},
+                      stale_done: {"status": "fired"},
+                      today_key: {"status": "fired"}},
+            "running_extremes": {}, "last_obs_time": {},
+            "taf_forecasts": {}, "last_obs": {},
+        },
+    }
+    removed = prune_stale_sessions(state, [city], now)
+    fired = state["weatherbotyes2re"]["fired"]
+    ok = (removed == 1 and stale_open in fired and today_key in fired
+          and stale_done not in fired)
+    return {"name": "prune_keeps_open_fired", "removed": removed,
+            "kept_fired": sorted(fired), "ok": ok}
 
 
 def scenario_stale_obs_no_fire():
@@ -246,7 +317,10 @@ def run_scenarios():
         scenario_no_double_fire,
         scenario_consensus_blocks_non_leader,
         scenario_prune_stale,
+        scenario_prune_keeps_open_fired,
         scenario_stale_market_date,
+        scenario_tz_unresolvable_fail_closed,
+        scenario_missing_tz_fail_closed,
     ):
         r=fn(); results.append(r)
         if not r.get("ok"): failed += 1

@@ -97,10 +97,18 @@ def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], no
     Pure, deterministic, never raises; only the four sections above are
     mutated (taf_forecasts / last_obs / other state content are untouched).
     A session key has the shape ``city_id|market_local_date|direction`` (see
-    session_key). Three removal rules:
+    session_key). Removal rules:
 
       1. Non-today date: market-local date != the city's local today
-         (cross-day carryover from a previous market day) -> delete.
+         (cross-day carryover from a previous market day) -> delete — EXCEPT a
+         ``fired`` marker whose session still has an open paper position. That
+         marker is the session's one-fire dedupe credential: between a city's
+         local-midnight rollover and the next rules-TTL refresh the cache can
+         still feed the old-date rule, and dropping the marker while its
+         position is open re-opened the 2026-09-06 re-fire loop (same breach
+         obs -> already_fired miss -> re-fire -> cash reserved with no leg to
+         settle). The marker is kept until the position settles.
+
       2. Unknown city: city_id no longer present in the registry -> delete
          (defensive: registration table shrank).
       3. low zombie (armed only): a ``low`` session whose city local hour is
@@ -115,6 +123,7 @@ def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], no
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     tree = ensure_re_state(state)
+    positions = state.get("positions") or {}
     by_id = {c.get("city_id"): c for c in cities if c.get("city_id") is not None}
     removed = 0
     for section in ("armed", "fired", "running_extremes", "last_obs_time"):
@@ -139,6 +148,10 @@ def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], no
             except Exception:
                 continue  # bad tz entry — skip this city, never raise
             if market_local_date != local_dt.date().isoformat():
+                if section == "fired":
+                    pos = positions.get(key)
+                    if pos is not None and not pos.get("settled"):
+                        continue  # keep the one-fire dedupe credential until the position settles
                 del section_state[key]
                 removed += 1
                 continue
@@ -257,10 +270,17 @@ def maybe_arm_or_fire(
     # on every cycle (~$230/min paper burn on both A/B arms). Skipping stale
     # dates here closes the loop: prune keeps cleaning, nothing re-fires.
     try:
-        city_tz = city.get("timezone") or "UTC"
+        city_tz = city.get("timezone")
+        if not city_tz:
+            raise ValueError("city missing timezone")
         local_today = now_utc.astimezone(ZoneInfo(city_tz)).date().isoformat()
-    except Exception:  # noqa: BLE001 — bad tz: fall through to normal checks
-        local_today = market_local_date
+    except Exception:  # noqa: BLE001 — bad/missing tz: FAIL CLOSED. "Today" in
+        # the city's tz cannot be verified, so never arm/fire (the previous
+        # fallback set local_today = market_local_date, which self-disabled the
+        # guard and re-opened the 2026-09-06 stale-date re-fire path for any
+        # city whose tz entry ever broke or went missing).
+        return [{"action_type": "re_skip", "reason": "stale_market_date",
+                 "key": key, "guard": "tz_unresolvable"}]
     if market_local_date != local_today:
         return [{"action_type": "re_skip", "reason": "stale_market_date", "key": key}]
 

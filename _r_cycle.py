@@ -99,6 +99,33 @@ def target_dates_by_icao(
     return out
 
 
+def _rule_is_local_today(rule: dict[str, Any], city_by_id: dict[str, Any], now_utc: datetime) -> bool:
+    """True only when ``rule``'s market_local_date is still the city's local today.
+
+    Single source of truth for the cross-midnight date guard (2026-09-06
+    incident: chicago re-fired every cycle after local midnight because prune
+    dropped the fired marker while the TTL'd rules cache still fed the
+    old-date rule). Fails closed: an unknown city, a missing/bad timezone, or
+    a missing rule date yields False — a session whose "today" cannot be
+    verified must never arm/fire/sleeve. NOTE: this guard deliberately
+    imports ZoneInfo locally — the hotfix guard at the sleeve call site
+    referenced an unimported ``ZoneInfo`` name, so every evaluation raised
+    NameError and fell through to the fail-open branch (guard never fired).
+    """
+    city = city_by_id.get(rule.get("city_id"))
+    if city is None:
+        return False
+    tz_name = city.get("timezone")
+    rl_date = rule.get("market_local_date")
+    if not rl_date or not tz_name:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        return rl_date == now_utc.astimezone(ZoneInfo(tz_name)).date().isoformat()
+    except Exception:  # noqa: BLE001 — bad tz entry: fail closed
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Rule discovery
 # --------------------------------------------------------------------------- #
@@ -720,6 +747,20 @@ def _expire_stale_sleeves(cfg: dict[str, Any], state: dict[str, Any], now_utc: d
                 "ts_utc": now_utc.isoformat(),
             },
         )
+    # --- bookkeeping sweep (2026-09-06 review, residual-state cleanup) ---- #
+    # Drop sleeve *records* that are no longer protecting anything: status is
+    # closed (validated/expired) AND the sleeve's paper position is settled or
+    # gone. "open" records are left to the timeout logic above; "no_fill" /
+    # "expired_no_position" records stay so an unfillable session is not
+    # re-attempted every cycle (dedupe intent). Positions settle passively via
+    # settle_markets, at which point the validated record becomes sweepable.
+    for sess_key, rec in list(sleeves.items()):
+        if rec.get("status") in ("open", "no_fill", "expired_no_position"):
+            continue
+        pos = positions.get(f"{sess_key}#sleeve")
+        if pos is not None and not pos.get("settled"):
+            continue
+        del sleeves[sess_key]
 
 
 # --------------------------------------------------------------------------- #
@@ -949,8 +990,24 @@ def run_cycle(
     # Determine armed keys
     tree = ensure_re_state(state)
     armed_keys = set(tree.get("armed", {}).keys())
-    # 2) Books for consensus/arm at rule scope
-    rules_now = list(rules_idx.values())
+    # 2) Books for consensus/arm at rule scope. Feed ONLY today-dated rules
+    # (2026-09-06 incident, second layer): between a city's local-midnight
+    # rollover and the next rules-TTL refresh the cache can still list the old
+    # date's rules, and prune has already cleared their sessions this cycle —
+    # feeding them would re-open the stale-date arm/fire/sleeve path. Stale
+    # rules are counted and logged once per cycle (a watcher-visible rollover
+    # window), never fed to consensus, sleeve, or strategy.
+    city_by_id = {c["city_id"]: c for c in cities}
+    rules_now: list[dict[str, Any]] = []
+    stale_rule_keys: list[str] = []
+    for key, rule in rules_idx.items():
+        if _rule_is_local_today(rule, city_by_id, now):
+            rules_now.append(rule)
+        else:
+            stale_rule_keys.append(key)
+    if stale_rule_keys:
+        log_event(log_path, {"type": "stale_rules_ignored", "count": len(stale_rule_keys),
+                             "keys": stale_rule_keys, "ts_utc": now.isoformat()})
     # token set from every *enabled active* rule bucket
     tokens = _all_tokens_for_rules(rules_idx)
     book_ttl = float(cfg.get("idle_book_interval_seconds", DEFAULTS["idle_book_interval_seconds"]))
@@ -1101,7 +1158,6 @@ def run_cycle(
 
     # 4+5) Feed strategy per (city,direction) live contract for today
     armed_any = False
-    city_by_id = {c["city_id"]: c for c in cities}
     for rule in rules_now:
         # Build per-rule book map for the YES tokens that have addresses
         rule_books: dict[str, dict[str, Any]] = {}
@@ -1132,21 +1188,13 @@ def run_cycle(
         sleeve_cfg = cfg.get("strategy") or {}
         if sleeve_cfg.get("sleeve_enabled") and rule_books:
             srule = rule.get("buckets") or []
-            if srule:
-                # Cross-midnight guard (same incident as reversal_strategy):
-                # never sleeve a session whose market local date is not today.
-                city_tz = city_by_id.get(rule.get("city_id"), {}).get("timezone") or "UTC"
-                try:
-                    rl_today = rule.get("market_local_date")
-                    local_today = now.astimezone(ZoneInfo(city_tz)).date().isoformat()
-                    if rl_today and rl_today != local_today:
-                        # stale-date rule: skip sleeve (still feed ring below is
-                        # pointless for a dead session — skip entirely)
-                        pass
-                    else:
-                        _sleeve_tick(cfg, state, rule, rule_books, tree, now)
-                except Exception:  # noqa: BLE001 — bad tz: fall back to running sleeve
-                    _sleeve_tick(cfg, state, rule, rule_books, tree, now)
+            # Cross-midnight guard (2026-09-06 incident, same as
+            # reversal_strategy.maybe_arm_or_fire): never sleeve a rule whose
+            # market_local_date is not the city's local today. _rule_is_local_today
+            # fails closed (unknown city / bad or missing tz / missing date ->
+            # False), so a dead-date session can never reserve sleeve cash.
+            if srule and _rule_is_local_today(rule, city_by_id, now):
+                _sleeve_tick(cfg, state, rule, rule_books, tree, now)
         icao = city_by_id.get(rule.get("city_id"), {}).get("icao", "").upper()
         obs = metar_by_icao.get(icao)
         if obs is None or obs.get("temp_c") is None:

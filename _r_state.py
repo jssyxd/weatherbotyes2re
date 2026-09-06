@@ -52,6 +52,38 @@ DEFAULTS: dict[str, Any] = {
 
 _LOG_FIELDS_STR = None
 
+# JSONL rotation (2026-09-06 review): the events log grows without bound
+# (~0.6 MB/h at arm cadence; ~15 MB/day idle — instance A had already
+# reached 13.5 MB / 90k lines in 22 h). Rotate size-based, keep
+# LOG_KEEP rotated generations plus the live file. log_event has no cfg
+# handle, so these are module constants (tune via environment if ever
+# needed). Rotation is best-effort and never raises.
+LOG_MAX_BYTES = 64 * 1024 * 1024
+LOG_KEEP = 3
+
+
+def _rotate_events_log(path: Path) -> None:
+    """Shift ``path`` -> ``path.1`` -> ``path.2`` ... when the live log exceeds
+    :data:`LOG_MAX_BYTES`. Best-effort: any OSError silently leaves the log
+    unrotated (the observer path must stay up)."""
+    try:
+        if not path.exists():
+            return
+        if path.stat().st_size < LOG_MAX_BYTES:
+            return
+        # Drop the oldest generation, then shift .1 -> .2 ... (K-1) -> K, and
+        # finally rotate the live file -> .1. At most LOG_KEEP backups exist.
+        oldest = path.with_name(f"{path.name}.{LOG_KEEP}")
+        if oldest.exists():
+            oldest.unlink()
+        for i in range(LOG_KEEP - 1, 0, -1):
+            src = path.with_name(f"{path.name}.{i}")
+            if src.exists():
+                src.replace(path.with_name(f"{path.name}.{i + 1}"))
+        path.replace(path.with_name(f"{path.name}.1"))
+    except OSError:
+        pass
+
 
 def _decode(obj: Any) -> Any:
     if isinstance(obj, dict):
@@ -168,6 +200,7 @@ def log_event(path: str | os.PathLike, event: dict[str, Any]) -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
         if "ts_utc" not in event:
             event["ts_utc"] = datetime.now(timezone.utc).astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        _rotate_events_log(p)  # size-check BEFORE append: live file always exists after a write
         with open(p, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, default=str, ensure_ascii=False) + "\n")
     except OSError:
