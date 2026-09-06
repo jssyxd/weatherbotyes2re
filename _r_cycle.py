@@ -163,6 +163,12 @@ def refresh_rules(
     idx: dict[str, Any] = {}
     for rule in rules:
         k = _rules_key(rule["city_id"], rule["market_local_date"], rule["direction"])
+        # Inject the session key into the rule dict. Consumers (_sleeve_tick /
+        # _enter_sleeve / action_key_in_tree / _sleeve_enter_ok) read
+        # rule["key"] / rule.get("key") and would KeyError on the sleeve signal
+        # path without it (sleeve_tick_error: KeyError 'key' ×53 on B2, the
+        # sleeve arm never actually entered — 2026-09-06 finding).
+        rule["key"] = k
         idx[k] = rule
     _store_rule_cache(idx, failures)
     bump("rules", time.time())
@@ -564,7 +570,7 @@ def _sleeve_tick(
         )
         if det is not None:
             n_idx, sig = det
-            sig.key = rule["key"]
+            sig.key = rule.get("key", "")
             sig.city_id = rule.get("city_id", "")
             sig.market_local_date = rule.get("market_local_date", "")
             log_event(cfg.get("log_path"), sig.as_event(now_utc.isoformat()))
@@ -596,7 +602,13 @@ def _enter_sleeve(
             return
         sleeve_cfg = cfg.get("strategy") or {}
         max_ask = str(sleeve_cfg.get("sleeve_max_ask", 0.35))
-        sleeve_key = f"{rule['key']}#sleeve"
+        sess_key = str(rule.get("key") or "")
+        if not sess_key:
+            # Defensive: a rule without an injected session key cannot be
+            # recorded as a sleeve — abort rather than fabricate a bad key.
+            log_event(cfg.get("log_path"), {"type": "sleeve_error", "error": "sleeve rule missing key"})
+            return
+        sleeve_key = f"{sess_key}#sleeve"
         fire: dict[str, Any] = {
             "action_type": "re_sleeve",
             "key": sleeve_key,
@@ -625,7 +637,7 @@ def _enter_sleeve(
             pos = state.setdefault("positions", {})
             pos[sleeve_key] = position
             tree2 = state.setdefault("weatherbotyes2re", {})
-            tree2.setdefault("sleeves", {})[rule["key"]] = {
+            tree2.setdefault("sleeves", {})[sess_key] = {
                 "entered_at_utc": re_execution.iso_utc(now_utc),
                 "bucket_id": bucket_id,
                 "token_id": yes_tok,
@@ -636,7 +648,7 @@ def _enter_sleeve(
                 {
                     "type": "sleeve_entered",
                     "key": sleeve_key,
-                    "session_key": rule["key"],
+                    "session_key": sess_key,
                     "bucket_id": bucket_id,
                     "reason": sig.reason,
                     "fills": {
@@ -649,7 +661,7 @@ def _enter_sleeve(
         else:
             # nothing fillable — record intent so we don't retry every cycle
             tree2 = state.setdefault("weatherbotyes2re", {})
-            tree2.setdefault("sleeves", {})[rule["key"]] = {
+            tree2.setdefault("sleeves", {})[sess_key] = {
                 "entered_at_utc": re_execution.iso_utc(now_utc),
                 "bucket_id": bucket_id,
                 "token_id": yes_tok,
