@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,7 @@ OBS_MAX_FUTURE_SECONDS = 900     # 15 min sanity: US AWS stations publish ~7 min
 CONSENSUS_WINDOW_SECONDS = 7200  # 2h default; config can set 3600
 CONSENSUS_MIN_SAMPLES = 20
 CONSENSUS_MIN_LEAD = Decimal("0.03")
+BREAK_CONFIRM_MARGIN_F = 1.0  # F-market boundary-confirmation margin (whole °F), 2026-09-07
 ZERO = Decimal("0")
 
 
@@ -377,6 +379,30 @@ def maybe_arm_or_fire(
             tree["armed"].pop(key, None)
             actions.append({"action_type": "re_disarm", "key": key, "reason": "moved_away"})
         return actions
+
+    # F-market boundary confirmation (2026-09-07, SF 9/4 low misfire).
+    # METAR temperatures are whole-degree Celsius; after °C→°F the converted
+    # extreme can sit anywhere in a ±0.9°F band (14°C = 57.2-58.8°F), while
+    # Wunderground finalizes the daily extreme at whole °F post-QC. A break
+    # computed on the raw converted float (57.92 < 58) can therefore be FALSE
+    # when the finalized extreme stays inside the broken bucket (58.x°F).
+    # Require the whole-degree °F extreme to clear the broken-bucket boundary
+    # by break_confirm_margin_f (default 1°F): a low break of the 58-59°F
+    # bucket needs round(running) <= 57. C markets are exempt: METAR whole °C
+    # truncation aligns exactly with Polymarket's whole-degree truncation rule.
+    unit = str(city.get("market_unit") or "C").upper()
+    if unit == "F":
+        margin_f = float(cfg.get("break_confirm_margin_f", BREAK_CONFIRM_MARGIN_F))
+        if margin_f > 0:
+            run_w = float(math.floor(running + 0.5))  # whole °F (ASOS display convention)
+            b_lo = float(taf_b.get("lo") if taf_b.get("lo") is not None else taf_b.get("hi", 0))
+            b_hi = float(taf_b.get("hi") if taf_b.get("hi") is not None else b_lo)
+            if direction == "high" and run_w < b_hi + margin_f:
+                return [{"action_type": "re_skip", "reason": "break_not_confirmed", "key": key,
+                         "jump": jump, "run_whole_f": run_w, "bucket_hi": b_hi, "margin_f": margin_f}]
+            if direction == "low" and run_w > b_lo - margin_f:
+                return [{"action_type": "re_skip", "reason": "break_not_confirmed", "key": key,
+                         "jump": jump, "run_whole_f": run_w, "bucket_lo": b_lo, "margin_f": margin_f}]
 
     # jump > 0 : potential break
     if not hour_ok(direction, local_hour, high_hour, low_hour_end):

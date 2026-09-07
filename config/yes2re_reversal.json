@@ -45,7 +45,8 @@
     "sleeve_short_window_s": 150,
     "sleeve_long_window_s": 600,
     "sleeve_timeout_s": 1800,
-    "sleeve_min_ticks": 4
+    "sleeve_min_ticks": 4,
+    "break_confirm_margin_f": 1.0
   },
   "settle_poll_seconds": 60,
   "ws_triggered_metar_enabled": true

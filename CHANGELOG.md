@@ -1,5 +1,35 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-07 — F-market unit audit + boundary-confirmation margin
+
+- **Polymarket unit rules audited & documented** (`research/common.py`
+  `c_to_market_unit` docstring):
+  - Buckets: US cities 1-2°F integer buckets; EU/Asia cities 1°C buckets.
+  - Resolution: Wunderground station "Daily Observations" — finalized daily
+    extreme at whole degrees, post-QC (NOT intraday METAR, NOT the NWS CLI
+    summary, NOT the WU "Day High & Low" box). Stated precision rule is
+    truncation for °C buckets (23.9°C → 23).
+  - METAR has NO native °F anywhere (global °C, incl. US ASOS). US ASOS
+    displays whole °F via rounding — our °C→°F round matches that display
+    convention; the Polymarket truncation rule applies to the °C-bucket side
+    where whole-degree METAR already aligns naturally.
+- **F-market break-confirmation margin** (`reversal_strategy.py`,
+  `break_confirm_margin_f` default 1.0, config key added): a °F-market fire
+  requires the whole-degree converted extreme to clear the broken-bucket
+  boundary by ≥1°F. Motivation: SF 9/4 low misfire — METAR 14°C converted to
+  57.92°F < 58 (break), but Wunderground finalized 58.x°F (no break): METAR
+  whole-°C granularity spans ±0.9°F after conversion and the finalized daily
+  extreme can differ ~1°F from the intraday METAR extreme.
+- **Back-test on real °F fills (2026-09-05→07, 5 trades)**: margin=1 would
+  have kept SF 9/6 (YES@0.52 WON) and SF 9/7 (open), and filtered chicago
+  9/5 low (NO@0.97 LOST — the SF-class false break) — but it would also have
+  filtered atlanta 9/6 low (NO@0.92 WON + YES WON) and austin 9/5 high
+  (YES@0.98 WON), both genuine near-boundary breaks. Trade-off is documented
+  and tunable: 0.0 = legacy float behavior (fire all near-boundary breaks),
+  1.0 = filter all <1°F-deep breaks (default, prevents SF-class false
+  breaks at the cost of genuine near-boundary fills). C markets are exempt
+  (whole-degree truncation aligns exactly).
+
 ## 2026-09-04 — Fire deadlock fix; WS live feed; paper-ledger fix (audited)
 
 - **obs sanity window (was: absolute 180 s age gate → structurally zero fires).**

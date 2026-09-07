@@ -11,6 +11,7 @@ import calendar
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+import math
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -181,7 +182,13 @@ def parse_obs_time_utc(raw_metar: str, now: datetime | None = None) -> datetime 
         return None
     day, hh, mm = int(m.group(1)), int(m.group(2)), int(m.group(3))
     try:
-        dt = now.replace(day=day, hour=hh, minute=mm, second=0, microsecond=0)
+        if day > now.day:
+            # METAR dd day rolled past the end of the current month: the obs is
+            # from the previous month (last METAR before month boundary).
+            prev_end = now.replace(day=1) - timedelta(days=1)
+            dt = prev_end.replace(day=day, hour=hh, minute=mm, second=0, microsecond=0)
+        else:
+            dt = now.replace(day=day, hour=hh, minute=mm, second=0, microsecond=0)
     except ValueError:
         return None
     if (now - dt).total_seconds() < -6 * 3600:
@@ -192,10 +199,30 @@ def parse_obs_time_utc(raw_metar: str, now: datetime | None = None) -> datetime 
 
 
 def c_to_market_unit(temp_c: float, market_unit: str) -> float:
-    """ICAO METAR/TAF temperatures are Celsius; US Polymarket buckets are often °F."""
+    """ICAO METAR/TAF temperatures are Celsius; US Polymarket buckets are often °F.
+
+    For °F markets we replicate the official/NWS convention: METAR °C is
+    converted and rounded to the nearest whole degree (22 °C -> 71.6 -> 72).
+    Raw float 71.6 falls below a 72-73°F bucket boundary and misclassifies a
+    boundary reading as a broken bucket (Chicago NO misfire, 2026-09-05).
+
+    Polymarket unit rules (audited 2026-09-07):
+    - Buckets: US cities 1-2°F integer buckets; EU/Asia cities 1°C buckets.
+    - Resolution: Wunderground station "Daily Observations" finalized daily
+      extreme, whole degrees, post-QC (not intraday METAR, not NWS CLI
+      summary). Truncation (23.9°C -> 23) is the stated °C rule.
+    - METAR has NO native °F anywhere (global °C). US ASOS displays whole °F
+      via rounding, which is why we round here rather than truncate — the
+      truncation rule applies to the °C-bucket side, where whole-degree METAR
+      (a truncated reading) aligns naturally.
+    - Residual risk: METAR whole-°C granularity spans ±0.9°F after conversion,
+      and the finalized Wunderground extreme can differ ~1°F from the METAR
+      extreme (SF 9/4 low misfire). The F-market break-confirmation margin
+      (break_confirm_margin_f) in reversal_strategy.py absorbs this.
+    """
     unit = (market_unit or "C").upper()
     if unit == "F":
-        return temp_c * 9.0 / 5.0 + 32.0
+        return float(math.floor(temp_c * 9.0 / 5.0 + 32.0 + 0.5))
     return float(temp_c)
 
 
