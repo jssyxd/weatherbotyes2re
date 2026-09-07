@@ -1,5 +1,35 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-08 — Fire-window intervalization (HIGH 13-17 / LOW 1-9 local)
+
+- **`reversal_strategy.py` fire window switched from single-edge bounds to
+  inclusive local hour intervals.** One-bucket reversal fires now gate on:
+  - HIGH: local `13 <= hour <= 17` (was `hour >= 14`, no upper bound)
+  - LOW: local `1 <= hour <= 9` (was `hour <= 10`, no lower bound)
+- Constants: `HIGH_FIRE_LOCAL_HOUR` / `LOW_FIRE_LOCAL_HOUR_END` removed →
+  `HIGH_FIRE_LOCAL_START=13` / `HIGH_FIRE_LOCAL_END=17` /
+  `LOW_FIRE_LOCAL_START=1` / `LOW_FIRE_LOCAL_END=9`. `hour_ok` now takes the
+  four window bounds and enforces `start <= h <= end` per direction. Both `arm`
+  and the pre-fire `hour_not_in_window` gate use the same window. `prune`
+  low-zombie sweep follows the new low end (9).
+- Config keys: `high_fire_local_hour` / `low_fire_local_hour_end` →
+  `high_fire_local_start` / `high_fire_local_end` /
+  `low_fire_local_start` / `low_fire_local_end` (`config/yes2re_reversal.json`
+  updated; old keys removed).
+- **Rationale:** the daily extreme (and the capped peak-tick reversal this
+  strategy sells) forms inside the window, not outside it. Real losses from
+  out-of-window fires: mexico-city low 02:02 (LOST), SF 9/7 01:00 local fire
+  (open, floating underwater) — both broke the reference at hours the peak
+  window does not span. Fires observed off-window are now suppressed.
+  Direction-specific windows also stop one city's LOW-break drift from firing
+  into the afternoon or a HIGH from firing predawn. On-window losses of the
+  chengdu class are a separate open question (bucket-break confirmation) and
+  are not addressed by this change.
+- Verified: `python3 tests_reversal.py` 16/16 PASS before and after (all 16
+  scenarios keep passing under the interval semantics); window-boundary
+  assertion (high 12/18 rejected, 13..17 accepted; low 0/10 rejected, 1..9
+  accepted) green.
+
 ## 2026-09-07 — F-market unit audit + boundary-confirmation margin
 
 - **Polymarket unit rules audited & documented** (`research/common.py`

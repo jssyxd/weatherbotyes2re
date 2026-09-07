@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 from re_execution import paper_match_fak, plan_fire_cycle, size_legs
-from reversal_strategy import maybe_arm_or_fire, ensure_re_state, prune_stale_sessions
+from reversal_strategy import maybe_arm_or_fire, ensure_re_state, prune_stale_sessions, iso_utc
 from consensus_tracker import ConsensusTracker
 TZ = "Asia/Shanghai"
 
@@ -96,20 +96,19 @@ def scenario_one_bucket_fill():
     return {"name":"one_bucket_fill","actions":[a["action_type"] for a in actions],"fire_jump":fire["jump"],"fills":{k:{kk:str(vv) for kk,vv in v.items()} for k,v in fills.items()},"leftover":{k:str(v) for k,v in leftover.items()},"send_faks":sum(1 for x in log if x.get("status")=="send_fak"),"ok":fills["buy_no_broken"]["shares"]>0}
 
 
-def scenario_two_bucket_yes_skipped():
-    # YES-primary strategy (2026-09-05): a TAF-sourced 2-bucket jump keeps the
-    # momentum YES leg on the observed bucket and drops the broken-bucket NO
-    # leg (its book is routinely empty — holders of a practically-won NO never
-    # sell). Renamed semantics: "two_bucket_no_skipped".
+def scenario_jump_must_be_one():
+    # T4: jump != 1 is noise — skip the WHOLE basket, no YES-only multi-bucket
+    # fire. Arm first (temp inside the reference bucket), then break by 2
+    # buckets -> re_skip jump_must_be_one, no re_fire.
     state={}; city=make_city(); buckets=make_buckets()
     now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
     seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 33.2, now, now, {}, PAPER_CFG, tracker)
-    fire=next((a for a in actions if a.get("action_type")=="re_fire"), None)
-    legs=[x["leg"] for x in (fire or {}).get("legs", [])]
-    return {"name":"two_bucket_no_skipped","types":[a["action_type"] for a in actions],"legs":legs,
-            "ok":fire is not None and "buy_yes_new" in legs and "buy_no_broken" not in legs}
+    maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 30.5, now, now, {}, PAPER_CFG, tracker)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 33.2, now+timedelta(minutes=1), now+timedelta(minutes=1), {}, PAPER_CFG, tracker)
+    types=[a["action_type"] for a in actions]
+    return {"name":"jump_must_be_one","types":types,
+            "ok":"re_fire" not in types and any(a.get("reason")=="jump_must_be_one" for a in actions)}
 
 
 def scenario_stale_market_date():
@@ -231,7 +230,8 @@ def scenario_cap_abort():
     tracker = ConsensusTracker(min_samples=3)
     seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
     books={"NO-31": make_book(0.80, depth=10), "YES-32": make_book(0.70, depth=8)}
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, books, PAPER_CFG, tracker)
+    maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 30.5, now, now, {}, PAPER_CFG, tracker)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now+timedelta(minutes=1), now+timedelta(minutes=1), books, PAPER_CFG, tracker)
     fire=next(a for a in actions if a["action_type"]=="re_fire")
     fills, leftover, log = run_fire_window(fire, books, Decimal("20"), now, scramble=False)
     aborted=[x for x in log if x.get("status")=="abort_above_cap"]
@@ -243,8 +243,9 @@ def scenario_no_double_fire():
     now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
     seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
-    a1=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
-    a2=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.4, now+timedelta(seconds=1), now+timedelta(seconds=1), {}, PAPER_CFG, tracker)
+    maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 30.5, now, now, {}, PAPER_CFG, tracker)
+    a1=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now+timedelta(minutes=1), now+timedelta(minutes=1), {}, PAPER_CFG, tracker)
+    a2=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.4, now+timedelta(minutes=2), now+timedelta(minutes=2), {}, PAPER_CFG, tracker)
     fires=[a for a in a1+a2 if a.get("action_type")=="re_fire"]
     return {"name":"no_double_fire","fires":len(fires),"second":[a.get("reason") for a in a2],"ok":len(fires)==1 and a2[0].get("reason")=="already_fired"}
 
@@ -254,7 +255,8 @@ def scenario_consensus_blocks_non_leader():
     now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
     tracker = ConsensusTracker(min_samples=3)
     seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h32", now)
-    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
+    maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 30.5, now, now, {}, PAPER_CFG, tracker)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now+timedelta(minutes=1), now+timedelta(minutes=1), {}, PAPER_CFG, tracker)
     return {
         "name": "consensus_blocks_non_leader",
         "types": [a.get("action_type") for a in actions],
@@ -306,16 +308,76 @@ def scenario_prune_stale():
             "stale_left": stale_left, "kept_missing": kept_missing, "untouched": untouched}
 
 
+def scenario_open_position_blocks_refire():
+    # T1 lock 2: an open (unsettled) paper position must block re-fire even if
+    # the fired marker was lost (simulate prune having dropped it).
+    state={}; city=make_city(); buckets=make_buckets()
+    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
+    state["positions"]={"shanghai|2026-09-01|high": {"settled": False, "fires_at_utc": now.isoformat()}}
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
+    types=[a.get("action_type") for a in actions]
+    return {"name":"open_position_blocks_refire","types":types,
+            "ok":"re_fire" not in types and any(a.get("reason")=="open_position_already_exists" for a in actions)}
+
+
+def scenario_same_obs_blocks_refire():
+    # T1 lock 3: the exact obs_time that already fired must be rejected with
+    # duplicate_obs_fired (read side of last_fire_obs).
+    state={}; city=make_city(); buckets=make_buckets()
+    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
+    tree=ensure_re_state(state)
+    tree["last_fire_obs"]["shanghai|2026-09-01|high"]=iso_utc(now)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
+    return {"name":"same_obs_blocks_refire","reasons":[a.get("reason") for a in actions],
+            "ok":any(a.get("reason")=="duplicate_obs_fired" for a in actions)}
+
+
+def scenario_restart_replay_fires_once():
+    # T2 restart replay: state with ever_armed but no armed marker and no fired
+    # (restart persisted pre-fire state) must still allow a single legit fire.
+    state={}; city=make_city(); buckets=make_buckets()
+    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
+    tree=ensure_re_state(state)
+    tree["ever_armed"]["shanghai|2026-09-01|high"]=iso_utc(now)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
+    fires=[a for a in actions if a.get("action_type")=="re_fire"]
+    return {"name":"restart_replay_fires_once","fires":len(fires),
+            "ok":len(fires)==1}
+
+
+def scenario_unarmed_break_blocked():
+    # T2 negative: a jump=1 break on a never-armed session is IDLE -> FIRED and
+    # must be rejected with break_without_arm.
+    state={}; city=make_city(); buckets=make_buckets()
+    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
+    actions=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, now, now, {}, PAPER_CFG, tracker)
+    types=[a.get("action_type") for a in actions]
+    return {"name":"unarmed_break_blocked","types":types,
+            "ok":any(a.get("reason")=="break_without_arm" for a in actions) and "re_fire" not in types}
+
+
 def run_scenarios():
     results=[]; failed=0
     for fn in (
         scenario_one_bucket_fill,
-        scenario_two_bucket_yes_skipped,
+        scenario_jump_must_be_one,
         scenario_stale_obs_no_fire,
         scenario_morning_skip,
         scenario_cap_abort,
         scenario_no_double_fire,
         scenario_consensus_blocks_non_leader,
+        scenario_open_position_blocks_refire,
+        scenario_same_obs_blocks_refire,
+        scenario_restart_replay_fires_once,
+        scenario_unarmed_break_blocked,
         scenario_prune_stale,
         scenario_prune_keeps_open_fired,
         scenario_stale_market_date,

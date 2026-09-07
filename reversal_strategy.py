@@ -20,6 +20,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from consensus_tracker import ConsensusTracker, DEFAULT_TRACKER
+from _r_state import _SECTIONS as STATE_SECTIONS
 
 ARM_C = 1.0
 MAX_BUCKET_JUMP = 1
@@ -27,8 +28,13 @@ NO_MAX_ASK = Decimal("0.85")
 YES_MAX_ASK = Decimal("0.48")
 NO_NOTIONAL_PCT = Decimal("0.75")
 YES_NOTIONAL_PCT = Decimal("0.25")
-HIGH_FIRE_LOCAL_HOUR = 14
-LOW_FIRE_LOCAL_HOUR_END = 10
+# Fire-window closing 2026-09-08: interval windows, not single edges.
+# HIGH fires only in local 13:00-17:00 (peak afternoons); LOW only in local
+# 01:00-09:00 (predawn/dawn). Rationale + incidents in CHANGELOG 2026-09-08.
+HIGH_FIRE_LOCAL_START = 13
+HIGH_FIRE_LOCAL_END = 17
+LOW_FIRE_LOCAL_START = 1
+LOW_FIRE_LOCAL_END = 9
 REQUIRE_FRESH_OBS_SECONDS = 180  # legacy absolute-age gate — deprecated 2026-09-03 (see OBS_* window below)
 OBS_MAX_LOOKBACK_SECONDS = 5400  # 90 min sanity: obs older than this = stale feed, do not fire
 OBS_MAX_FUTURE_SECONDS = 900     # 15 min sanity: US AWS stations publish ~7 min EARLY; >15 min ahead = bad stamp
@@ -50,7 +56,7 @@ def bucket_contains(bucket: dict[str, Any], value: float) -> bool:
 
 def ensure_re_state(state: dict[str, Any]) -> dict[str, Any]:
     tree = state.setdefault("weatherbotyes2re", {})
-    for name in ("armed", "fired", "running_extremes", "taf_forecasts", "last_obs", "last_obs_time"):
+    for name in STATE_SECTIONS:
         tree.setdefault(name, {})
     return tree
 
@@ -96,8 +102,9 @@ def session_key(city_id: str, market_local_date: str, direction: str) -> str:
 def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], now_utc: datetime | None = None) -> int:
     """Drop expired armed/fired/running_extremes/last_obs_time session entries.
 
-    Pure, deterministic, never raises; only the four sections above are
-    mutated (taf_forecasts / last_obs / other state content are untouched).
+    Pure, deterministic, never raises; only the six date-scoped sections
+    above are mutated (taf_forecasts / last_obs / other state content are
+    untouched).
     A session key has the shape ``city_id|market_local_date|direction`` (see
     session_key). Removal rules:
 
@@ -114,9 +121,9 @@ def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], no
       2. Unknown city: city_id no longer present in the registry -> delete
          (defensive: registration table shrank).
       3. low zombie (armed only): a ``low`` session whose city local hour is
-         already past LOW_FIRE_LOCAL_HOUR_END — the strategy hour window can
-         never fire it, so the armed entry would pin the run loop to
-         fast-poll forever -> delete.
+         already past LOW_FIRE_LOCAL_END — the strategy low window can never
+         fire it, so the armed entry would pin the run loop to fast-poll
+         forever -> delete.
 
     Malformed keys (not exactly 3 ``|``-separated parts) are kept as-is, and
     an unparseable timezone for a known city makes that city's keys skipped,
@@ -128,7 +135,7 @@ def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], no
     positions = state.get("positions") or {}
     by_id = {c.get("city_id"): c for c in cities if c.get("city_id") is not None}
     removed = 0
-    for section in ("armed", "fired", "running_extremes", "last_obs_time"):
+    for section in ("armed", "fired", "running_extremes", "last_obs_time", "ever_armed", "last_fire_obs"):
         section_state = tree.get(section)
         if not isinstance(section_state, dict):
             continue
@@ -157,7 +164,7 @@ def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], no
                 del section_state[key]
                 removed += 1
                 continue
-            if section == "armed" and direction == "low" and local_dt.hour > LOW_FIRE_LOCAL_HOUR_END:
+            if section == "armed" and direction == "low" and local_dt.hour > LOW_FIRE_LOCAL_END:
                 del section_state[key]
                 removed += 1
     return removed
@@ -179,10 +186,18 @@ def update_running_extreme(state, city_id, market_local_date, direction, temp: f
     return rec
 
 
-def hour_ok(direction: str, local_hour: int, high_hour: int, low_hour_end: int) -> bool:
+def hour_ok(direction, local_hour, high_start, high_end, low_start, low_end) -> bool:
+    """Inclusive local-hour window gate (2026-09-08 interval semantics).
+
+    HIGH: high_start <= local_hour <= high_end (default 13..17).
+    LOW:  low_start  <= local_hour <= low_end  (default 1..9).
+    Fire away from the window in which the daily extreme actually forms —
+    a break observed at 02:00 (mexico-city low) or 03:00 (SF high, off-window)
+    is off-peak drift, not the capped peak-tick reversal this strategy sells.
+    """
     if direction == "high":
-        return local_hour >= high_hour
-    return local_hour <= low_hour_end
+        return local_hour >= high_start and local_hour <= high_end
+    return local_hour >= low_start and local_hour <= low_end
 
 
 def obs_is_fresh(obs_time_utc: datetime | None, now_utc: datetime, max_age: int) -> bool:
@@ -252,8 +267,10 @@ def maybe_arm_or_fire(
     fresh_s = int(cfg.get("require_fresh_obs_seconds", REQUIRE_FRESH_OBS_SECONDS))  # legacy, unused by fire window
     obs_lookback_s = int(cfg.get("max_obs_lookback_seconds", OBS_MAX_LOOKBACK_SECONDS))
     obs_future_s = int(cfg.get("max_obs_future_seconds", OBS_MAX_FUTURE_SECONDS))
-    high_hour = int(cfg.get("high_fire_local_hour", HIGH_FIRE_LOCAL_HOUR))
-    low_hour_end = int(cfg.get("low_fire_local_hour_end", LOW_FIRE_LOCAL_HOUR_END))
+    high_start = int(cfg.get("high_fire_local_start", HIGH_FIRE_LOCAL_START))
+    high_end = int(cfg.get("high_fire_local_end", HIGH_FIRE_LOCAL_END))
+    low_start = int(cfg.get("low_fire_local_start", LOW_FIRE_LOCAL_START))
+    low_end = int(cfg.get("low_fire_local_end", LOW_FIRE_LOCAL_END))
     cons_win = int(cfg.get("consensus_window_seconds", CONSENSUS_WINDOW_SECONDS))
     cons_min_samples = int(cfg.get("consensus_min_samples", CONSENSUS_MIN_SAMPLES))
     cons_min_lead = Decimal(str(cfg.get("consensus_min_lead", CONSENSUS_MIN_LEAD)))
@@ -298,6 +315,34 @@ def maybe_arm_or_fire(
 
     if key in tree["fired"]:
         return [{"action_type": "re_skip", "reason": "already_fired", "key": key}]
+
+    # Bug 1 + Bug 3 — TRIPLE LOCK: in addition to the fired marker, refrain
+    # from re-firing when an open (unsettled) paper position already exists
+    # for this key. The state["positions"] ledger is the source of truth for
+    # "a fire actually produced work" — without this guard a prune-then-fire
+    # pattern (or a crash-mid-cycle on the live deploy) re-opens the same
+    # 22-fire-on-Seoul gate seen 2026-09-05 even though tree["fired"][key]
+    # remained set in memory.
+    _positions = state.get("positions") or {}
+    _existing = _positions.get(key)
+    if _existing is not None and not _existing.get("settled"):
+        tree["fired"][key] = {
+            "status": "fired_no_fill", "at_utc": iso_utc(now_utc),
+            "jump": None, "ref_source": "lock_open_position",
+            "reason": "open_position_already_exists",
+        }
+        return [{"action_type": "re_skip", "reason": "open_position_already_exists",
+                 "key": key, "fires_at_utc": _existing.get("fires_at_utc")}]
+
+    # Bug 3 — third lock: the exact same observation timestamp already
+    # produced a fire this session. is_new_obs_time below updates
+    # last_obs_time on every pass; this section reads last_fire_obs so a
+    # repeat push of the same obs (e.g. WS early-pull re-trigger on the
+    # same METAR stamp) cannot fire twice. Independent of last_obs_time.
+    _obs_iso = iso_utc(obs_time_utc) if obs_time_utc is not None else None
+    if _obs_iso is not None and tree.get("last_fire_obs", {}).get(key) == _obs_iso:
+        return [{"action_type": "re_skip", "reason": "duplicate_obs_fired",
+                 "key": key, "obs_time_utc": _obs_iso}]
 
     # Open-position cap: never open a new position while the number of
     # unsettled paper positions is at/over max_open_positions. Prevents
@@ -352,7 +397,7 @@ def maybe_arm_or_fire(
     jump = run_i - taf_i if direction == "high" else taf_i - run_i
 
     armed = tree["armed"].get(key)
-    if jump <= 0 and distance_c <= arm_c and hour_ok(direction, local_hour, high_hour, low_hour_end):
+    if jump <= 0 and distance_c <= arm_c and hour_ok(direction, local_hour, high_start, high_end, low_start, low_end):
         tree["armed"][key] = {
             "status": "armed",
             "taf_bucket_id": str(taf_b.get("bucket_id") or taf_b.get("id") or ""),
@@ -362,6 +407,11 @@ def maybe_arm_or_fire(
             "armed_at_utc": iso_utc(now_utc),
             "fast_poll": True,
         }
+        # Bug 2 — armed-ever: mark this session as having been armed at
+        # least once. persisted to disk so the Bug 2 gate below can accept
+        # a fire from armed-history even when the in-memory armed marker
+        # was popped at the end of a prior arm/fire cycle.
+        tree.setdefault("ever_armed", {})[key] = iso_utc(now_utc)
         actions.append({
             "action_type": "re_arm",
             "key": key,
@@ -405,7 +455,7 @@ def maybe_arm_or_fire(
                          "jump": jump, "run_whole_f": run_w, "bucket_lo": b_lo, "margin_f": margin_f}]
 
     # jump > 0 : potential break
-    if not hour_ok(direction, local_hour, high_hour, low_hour_end):
+    if not hour_ok(direction, local_hour, high_start, high_end, low_start, low_end):
         return [{"action_type": "re_skip", "reason": "hour_not_in_window", "key": key, "jump": jump}]
     # Freshness = "a NEW observation arrived" (deduped by is_new_obs_time
     # above) — NOT "the observation happened within N seconds". METAR/SPECI
@@ -423,6 +473,45 @@ def maybe_arm_or_fire(
 
     broken = taf_b
     broken_id = str(broken.get("bucket_id") or broken.get("id") or "")
+
+    # Bug 2 + Bug 4 — single-bucket break, state-machine guard.
+    # Bug 4: only jump == 1 fires. The whole strategy rests on
+    # "afternoon peak is gradual, the market consensus concentrates on one
+    # bucket, the probability of two-bucket crossing in the 13:00-17:00
+    # window is essentially zero". Anything else is noise (the historical
+    # 2026-09-05 jump=6/2 misfires all came from this path); default to
+    # skip the whole basket, not "fire YES only" — the YES-primary
+    # oversize-TAF branch has done us no favours in production.
+    if jump != 1:
+        tree["fired"][key] = {
+            "status": "fired_no_fill", "at_utc": iso_utc(now_utc),
+            "jump": jump, "ref_source": ref_source,
+            "reason": "jump_must_be_one",
+        }
+        tree["armed"].pop(key, None)
+        return [{"action_type": "re_skip", "reason": "jump_must_be_one",
+                 "key": key, "jump": jump, "ref_source": ref_source}]
+
+    # Bug 2 — state-machine gate: IDLE -> ARMED -> FIRED. A jump>0 fire is
+    # only valid if this session was armed this cycle (`armed`) or any prior
+    # cycle (`ever_armed`). break_without_arm = jump was detected without
+    # the prior arming confirmation; that's an "uncommitted observation"
+    # path and must not place orders. The 2026-09-05 Seoul 22-fire storm
+    # is partly explained by re-arm + fire falling out of the armed state
+    # in prune; this gate sits between fresh arm and the fire builder so
+    # it never re-fires a session that never confirmed proximity to the
+    # consensus.
+    ever = tree.get("ever_armed", {}).get(key)
+    if armed is None and not ever:
+        tree["fired"][key] = {
+            "status": "fired_no_fill", "at_utc": iso_utc(now_utc),
+            "jump": jump, "ref_source": ref_source,
+            "reason": "break_without_arm",
+        }
+        tree["armed"].pop(key, None)
+        return [{"action_type": "re_skip", "reason": "break_without_arm",
+                 "key": key, "jump": jump,
+                 "ref_source": ref_source, "ever_armed": bool(ever)}]
 
     # Long-horizon consensus filter on the *broken* bucket
     consensus_meta: dict[str, Any] = {"ok": True, "reason": "disabled"}
@@ -545,6 +634,9 @@ def maybe_arm_or_fire(
             "cap": str(cfg.get("yes_max_ask", YES_MAX_ASK)),
             "notional_pct": str(cfg.get("yes_notional_pct", YES_NOTIONAL_PCT)),
         })
+    # Bug 3 — third lock, write side: stamp the exact obs_time this fire
+    # was dispatched on. Future cycles on the same key use this to reject
+    # duplicate pushes before the is_new_obs_time check runs.
     tree["fired"][key] = {
         "status": "fired",
         "at_utc": iso_utc(now_utc),
@@ -553,5 +645,10 @@ def maybe_arm_or_fire(
         "consensus_rank": consensus_meta.get("rank"),
     }
     tree["armed"].pop(key, None)
+    if obs_time_utc is not None:
+        tree.setdefault("last_fire_obs", {})[key] = iso_utc(obs_time_utc)
+    # Bug 2 — keep ever_armed also up to date so a re-arm this session
+    # is reflected.
+    tree.setdefault("ever_armed", {})[key] = iso_utc(now_utc)
     actions.append({"action_type": "re_fire", **fire})
     return actions
