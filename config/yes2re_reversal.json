@@ -9,7 +9,7 @@
   "taf_refresh_interval_seconds": 1800,
   "checkwx_api_key_env": "CHECKWX_API_KEY",
   "base_fee_rate": "0.02",
-  "paper_initial_capital_usdc": 200.0,
+  "paper_initial_capital_usdc": 500.0,
   "fire_budget_usdc": 20.0,
   "max_open_positions": 12,
   "settle_grace_hours": 2,
