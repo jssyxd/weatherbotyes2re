@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from reversal_strategy import ensure_re_state
 from _r_state import load_config, load_state, save_state, log_event, STATE_VERSION
 from _r_cycle import run_cycle
+import _r_globals
 from _r_exec import write_health
 from research import common as _common_adapter
 
@@ -83,7 +84,22 @@ def main() -> int:
             print(f"max-seconds {args.max_seconds} reached — stopping", flush=True)
             break
         sleep_s = cfg["fast_poll_interval_seconds"] if armed else cfg["scan_interval_seconds"]
-        time.sleep(float(sleep_s))
+        if armed:
+            # WS-event wake: when a watched (armed-session) token moves on the
+            # market feed, skip the rest of the sleep and run the next cycle
+            # immediately, so fire decisions ride the tick instead of the
+            # fixed fast cadence (avg saving ~ fast_poll/2 + reaction time).
+            _wake_before = _r_globals.wake_epoch()
+            _deadline = time.time() + float(sleep_s)
+            while True:
+                _remaining = _deadline - time.time()
+                if _remaining <= 0:
+                    break
+                if _r_globals.wake_epoch() > _wake_before:
+                    break
+                time.sleep(min(0.15, _remaining))
+        else:
+            time.sleep(float(sleep_s))
     write_health(cfg, state)
     return 0
 

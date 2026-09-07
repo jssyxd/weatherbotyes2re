@@ -197,34 +197,6 @@ class CLOBMarketData:
             except CLOBDataError:
                 continue
         return parsed
-        for chunk_start in range(0, len(ids), BOOKS_CHUNK_SIZE):
-            chunk = ids[chunk_start:chunk_start + BOOKS_CHUNK_SIZE]
-            try:
-                raw = self._request_json(
-                    BOOKS_ENDPOINT,
-                    payload=[{"token_id": token} for token in chunk],
-                    timeout=self.timeout_seconds,
-                )
-                items = raw if isinstance(raw, list) else raw.get("books", []) if isinstance(raw, dict) else []
-                for item in items:
-                    if isinstance(item, dict) and item.get("asset_id") is not None:
-                        token = str(item["asset_id"])
-                        if token in chunk:
-                            parsed[token] = self._parse_book(token, item, "rest_batch")
-            except CLOBDataError:
-                pass
-            missing = [token for token in chunk if token not in parsed]
-            for token in missing:
-                try:
-                    raw = self._request_json(
-                        f"{BOOK_ENDPOINT}?{urllib.parse.urlencode({'token_id': token})}",
-                        timeout=self.timeout_seconds,
-                    )
-                    parsed[token] = self._parse_book(token, raw, "rest_single")
-                except CLOBDataError:
-                    continue
-        self._books.update(parsed)
-        return parsed
 
     def get_cached(self, token_id: str, max_age_seconds: float | None = None) -> BookSnapshot | None:
         snapshot = self._books.get(str(token_id))

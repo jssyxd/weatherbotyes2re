@@ -8,6 +8,7 @@ import json
 from typing import Any, Iterable
 
 from local_order_book import LocalOrderBook, LocalBookSnapshot, OrderBookStateError
+from _r_globals import mark_wake, watch_tokens
 
 MARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
@@ -108,8 +109,11 @@ class MarketStream:
         return self.books[token]
 
     def _apply_book(self, body: dict[str, Any]) -> LocalBookSnapshot:
-        result = self._book(str(body.get("tokenId") or body.get("asset_id") or "")).apply_book(body)
+        token = str(body.get("tokenId") or body.get("asset_id") or "")
+        result = self._book(token).apply_book(body)
         self.event_count += 1
+        if token in watch_tokens():
+            mark_wake()
         return result
 
     def _apply_price_changes(self, body: dict[str, Any]) -> tuple[LocalBookSnapshot, ...]:
@@ -117,12 +121,16 @@ class MarketStream:
         if not isinstance(changes, list):
             raise MarketStreamError("price_changes_required")
         results = []
+        watched = watch_tokens()
         for change in changes:
             if not isinstance(change, dict):
                 raise MarketStreamError("invalid_price_change")
             if body.get("timestamp") is not None:
                 change = {**change, "timestamp": body["timestamp"]}
-            results.append(self._book(str(change.get("tokenId") or "")).apply_price_change(change))
+            token = str(change.get("tokenId") or "")
+            results.append(self._book(token).apply_price_change(change))
+            if token in watched:
+                mark_wake()
         self.event_count += 1
         return tuple(results)
 

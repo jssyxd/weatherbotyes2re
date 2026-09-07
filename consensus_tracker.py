@@ -188,9 +188,6 @@ class ConsensusTracker:
         rows: list[tuple[str, Decimal, Decimal]] = []
         for bid, series in self._series.get(key, {}).items():
             series.prune(now, win)
-            if len(series.samples) < self.min_samples and len(series.samples) < 5:
-                # still allow ranking if we have a few samples; caller checks min
-                pass
             tw = series.twap_mid(now, win)
             if tw is None:
                 continue

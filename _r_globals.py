@@ -15,12 +15,36 @@ from typing import Any
 
 from clob_market_data import CLOBMarketData
 from consensus_tracker import ConsensusTracker
+import time
 
 _TRACKER: ConsensusTracker | None = None
 _CLOB: CLOBMarketData | None = None
 
 # {token_id: ladder book dict}  (best_ask/best_bid/tick_size/asks[{price,size}])
 _BOOK_CACHE: dict[str, dict[str, Any]] = {}
+
+# WS-event wake: runner sleep is interrupted when an interesting token moves.
+_WAKE_EPOCH: float = 0.0
+_WATCH_TOKENS: set[str] = set()
+
+
+def mark_wake(epoch: float | None = None) -> None:
+    """Signal the run loop that a watched token changed (called on WS thread)."""
+    global _WAKE_EPOCH
+    _WAKE_EPOCH = time.time() if epoch is None else float(epoch)
+
+
+def wake_epoch() -> float:
+    return _WAKE_EPOCH
+
+
+def watch_tokens() -> set[str]:
+    return _WATCH_TOKENS
+
+
+def set_watch_tokens(tokens: set[str]) -> None:
+    global _WATCH_TOKENS
+    _WATCH_TOKENS = set(tokens)
 
 
 @dataclass

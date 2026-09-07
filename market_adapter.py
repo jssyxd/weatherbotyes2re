@@ -160,12 +160,12 @@ def refresh_market_rules(
         futures = {executor.submit(fetch_one, task): task for task in tasks}
         for future in as_completed(futures):
             if time.monotonic() - started >= total_deadline_seconds:
-                for pending in futures:
-                    pending.cancel()
-                for task in tasks:
-                    city, local_date, direction = task
-                    key = f"{city['city_id']}|{local_date}|{direction}"
-                    failures.setdefault(key, "market_discovery_deadline_exceeded")
+                for pending in list(futures):
+                    if not pending.done():
+                        pending.cancel()
+                        city, local_date, direction = futures[pending]
+                        key = f"{city['city_id']}|{local_date}|{direction}"
+                        failures.setdefault(key, "market_discovery_deadline_exceeded")
                 break
             key, error, parsed = future.result()
             if error:
