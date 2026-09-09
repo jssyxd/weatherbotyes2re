@@ -20,7 +20,7 @@ from typing import Any
 STATE_VERSION = 2
 
 # State tree sections we create on first load.
-_SECTIONS = ("armed", "fired", "running_extremes", "taf_forecasts", "last_obs", "last_obs_time")
+_SECTIONS = ("armed", "fired", "running_extremes", "taf_forecasts", "last_obs", "last_obs_time", "ever_armed", "last_fire_obs")
 
 # Sensible defaults when a key is absent from a (hand-written) config JSON.
 DEFAULTS: dict[str, Any] = {

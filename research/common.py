@@ -62,16 +62,55 @@ def http_text(url: str, headers: dict[str, str] | None = None, timeout: int = 30
         return resp.read().decode("utf-8")
 
 
+_TAF_PREFIX_MARKERS = frozenset({"AMD", "COR", "RTD", "CNL"})
+_TAF_ICAO_TOKEN_RE = re.compile(r"^[A-Z]{3,4}$")
+
+
+def _key_taf_entry(entry: str, wanted: set[str]) -> tuple[str, str] | None:
+    """Map one raw CheckWX TAF string to ``(real ICAO, body-after-ICAO)``.
+
+    Corrected/amended reports arrive as ``"TAF AMD EGLC 180600Z ..."`` (also
+    COR/RTD): token[1] is the amendment marker, NOT the station id. Naively
+    keying on ``parts[1]`` stored the EGLC TAF under "AMD", so EGLC was never
+    found and its reference silently fell back to market consensus (the
+    2026-09-08 London loss). The real ICAO is the first station-looking token
+    after any prefix markers that is a requested station; the body is every
+    token after it — a multi-line raw (embedded ``\\n``) is preserved because
+    the remainder is sliced, never re-joined. Returns None when no requested
+    station token precedes the issue time (entry is dropped, never mis-keyed).
+    """
+    tokens = entry.split()
+    if not tokens:
+        return None
+    start = 1 if tokens[0].upper() == "TAF" else 0
+    for i in range(start, len(tokens)):
+        tok = tokens[i].upper()
+        if tok[:1].isdigit():
+            break  # issue time reached — the station token must precede it
+        if tok in _TAF_PREFIX_MARKERS:
+            continue
+        if _TAF_ICAO_TOKEN_RE.match(tok) and tok in wanted:
+            rest = entry.split(None, i + 1)
+            return tok, rest[i + 1] if len(rest) > i + 1 else ""
+    return None
+
+
 def checkwx_taf(icaos: list[str], api_key: str, chunk: int = 15) -> dict[str, str]:
+    """Fetch CheckWX TAFs keyed by the REAL station ICAO — never by an
+    AMD/COR/RTD amendment marker (an amended report is ``"TAF AMD EGLC …"``
+    whose token[1] is "AMD"; keying on token[1] made EGLC unfindable)."""
     out: dict[str, str] = {}
+    wanted = {str(i).strip().upper() for i in icaos if str(i).strip()}
     for i in range(0, len(icaos), chunk):
         batch = icaos[i : i + chunk]
         url = f"{CHECKWX_BASE}/taf/{','.join(batch)}"
         data = http_json(url, headers={"X-API-Key": api_key})
         for entry in data.get("data", []):
-            parts = entry.split(None, 2)
-            if len(parts) >= 3 and parts[0].upper() == "TAF":
-                out[parts[1]] = parts[2]
+            if not isinstance(entry, str) or not entry.strip():
+                continue
+            keyed = _key_taf_entry(entry, wanted)
+            if keyed is not None:
+                out[keyed[0]] = keyed[1]
     return out
 
 
@@ -315,3 +354,23 @@ def dual_source_metar(
             "source": src,
         }
     return out
+
+
+if __name__ == "__main__":  # offline self-check of the TAF keying logic
+    def _k(e: str, want: list[str]) -> tuple[str, str] | None:
+        return _key_taf_entry(e, {w.upper() for w in want})
+
+    # FIX-1 regression: "TAF AMD <ICAO> ..." must key under the real ICAO.
+    got = _k("TAF AMD EGLC 171800Z 1718/1818 23010KT TX24/1815Z", ["EGLC"])
+    assert got == ("EGLC", "171800Z 1718/1818 23010KT TX24/1815Z"), got
+    assert _k("TAF EGLC 180600Z 1806/1812 22010KT", ["EGLC"])[0] == "EGLC"
+    assert _k("TAF COR KORD 181200Z 1812/1824 24012KT", ["KORD"])[0] == "KORD"
+    assert _k("TAF RTD EDDM 180500Z 1806/1812 12008KT", ["EDDM"])[0] == "EDDM"
+    # multi-line raw survives verbatim (newlines intact, TX/TN still parseable)
+    ml = "TAF AMD EGLC 180600Z 1806/1812\n    1806/1812 22010KT 9999 SCT025\n    TX24/1812Z TN13/1806Z"
+    icao, body = _k(ml, ["EGLC"])
+    assert icao == "EGLC" and "\n" in body and parse_tx_tn(body)["tx_c"] == 24
+    # never mis-key an unknown/extra station; raw without the TAF prefix ok
+    assert _k("TAF AMD XXYY 180600Z 1806/1812 TX24/1812Z", ["EGLC"]) is None
+    assert _k("EGLC 180600Z 1806/1812 22010KT TX24/1812Z", ["EGLC"])[0] == "EGLC"
+    print("common.checkwx_taf keying self-check: OK")

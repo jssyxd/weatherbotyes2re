@@ -7,7 +7,17 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 from re_execution import paper_match_fak, plan_fire_cycle, size_legs
-from reversal_strategy import maybe_arm_or_fire, ensure_re_state, prune_stale_sessions, iso_utc
+from reversal_strategy import (
+    HIGH_FIRE_LOCAL_HOUR_END,
+    HIGH_FIRE_LOCAL_START,
+    LOW_FIRE_LOCAL_END,
+    LOW_FIRE_LOCAL_START,
+    hour_ok,
+    iso_utc,
+    maybe_arm_or_fire,
+    ensure_re_state,
+    prune_stale_sessions,
+)
 from consensus_tracker import ConsensusTracker
 TZ = "Asia/Shanghai"
 
@@ -364,6 +374,72 @@ def scenario_unarmed_break_blocked():
             "ok":any(a.get("reason")=="break_without_arm" for a in actions) and "re_fire" not in types}
 
 
+def scenario_market_ref_fire_allowed():
+    # 2026-09-08 operator decision: market-rank-1 reference MAY fire when the
+    # stable consensus bucket is broken by a fresh METAR extreme (Paris 27°C /
+    # Milan 32°C won exactly this way). No TAF needed. allow_market_ref_fire
+    # defaults True; set false to fail closed again.
+    state={}; city=make_city(); buckets=make_buckets()
+    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)  # Shanghai 16:00 local, in window (12-18)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
+    # no TAF (taf_extreme=None): reference = market rank-1 mid (h31 = 31.5)
+    a0=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, None, 31.0, now, now, {}, PAPER_CFG, tracker)
+    t2=now+timedelta(minutes=2)
+    a1=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, None, 32.4, t2, t2, {}, PAPER_CFG, tracker)
+    tree=ensure_re_state(state)
+    key="shanghai|2026-09-01|high"
+    fires=[x for x in a1 if x.get("action_type")=="re_fire"]
+    ok = (
+        any(x.get("action_type")=="re_arm" for x in a0)
+        and len(fires)==1
+        and fires[0].get("ref_source")=="market_rank1"
+        and key in tree["fired"]                    # fired marker written
+        and key not in tree["armed"]                # armed cleared after fire
+    )
+    return {"name":"market_ref_fire_allowed",
+            "reasons":[x.get("reason") for x in a1],
+            "fires":len(fires),
+            "ref_source":fires[0].get("ref_source") if fires else None,
+            "ok":ok}
+
+
+def scenario_high_late_evening_skip():
+    # HIGH window is 12..18 local (operator 2026-09-08). hour 18 is allowed
+    # (a late-afternoon peak tick); hour 19+ is off-window drift and must be
+    # skipped. LOW window is 0..9.
+    w = lambda h: hour_ok(h, 0, 0, 23, 0, 9)  # unused; keep clarity below
+    win = (
+        hour_ok("high", 12, HIGH_FIRE_LOCAL_START, HIGH_FIRE_LOCAL_HOUR_END, LOW_FIRE_LOCAL_START, LOW_FIRE_LOCAL_END)
+        and hour_ok("high", 18, HIGH_FIRE_LOCAL_START, HIGH_FIRE_LOCAL_HOUR_END, LOW_FIRE_LOCAL_START, LOW_FIRE_LOCAL_END)
+        and not hour_ok("high", 11, HIGH_FIRE_LOCAL_START, HIGH_FIRE_LOCAL_HOUR_END, LOW_FIRE_LOCAL_START, LOW_FIRE_LOCAL_END)
+        and not hour_ok("high", 19, HIGH_FIRE_LOCAL_START, HIGH_FIRE_LOCAL_HOUR_END, LOW_FIRE_LOCAL_START, LOW_FIRE_LOCAL_END)
+        and hour_ok("low", 0, HIGH_FIRE_LOCAL_START, HIGH_FIRE_LOCAL_HOUR_END, LOW_FIRE_LOCAL_START, LOW_FIRE_LOCAL_END)
+        and hour_ok("low", 9, HIGH_FIRE_LOCAL_START, HIGH_FIRE_LOCAL_HOUR_END, LOW_FIRE_LOCAL_START, LOW_FIRE_LOCAL_END)
+        and not hour_ok("low", 10, HIGH_FIRE_LOCAL_START, HIGH_FIRE_LOCAL_HOUR_END, LOW_FIRE_LOCAL_START, LOW_FIRE_LOCAL_END)
+    )
+    # end-to-end: an obs at local hour 19 (11:00Z Shanghai) on an armed TAF
+    # session is rejected with hour_not_in_window, nothing fired.
+    state={}; city=make_city(); buckets=make_buckets()
+    now=datetime(2026,9,1,8,0,tzinfo=timezone.utc)  # Shanghai 16:00 local (in window)
+    tracker = ConsensusTracker(min_samples=3)
+    seed_consensus_rank1(tracker, city, "2026-09-01", "high", "h31", now)
+    a0=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 30.5, now, now, {}, PAPER_CFG, tracker)
+    late=datetime(2026,9,1,11,0,tzinfo=timezone.utc)  # 19:00 Shanghai local -> hour 19
+    a1=maybe_arm_or_fire(state, city, "2026-09-01", "high", buckets, 31.0, 32.1, late, late, {}, PAPER_CFG, tracker)
+    tree=ensure_re_state(state)
+    blocked = (
+        any(x.get("reason")=="hour_not_in_window" for x in a1)
+        and not any(x.get("action_type")=="re_fire" for x in a1)
+        and not tree["fired"]
+    )
+    return {"name":"high_late_evening_skip",
+            "windows":win,
+            "armed_first":any(x.get("action_type")=="re_arm" for x in a0),
+            "reasons":[x.get("reason") for x in a1],
+            "ok":win and blocked}
+
+
 def run_scenarios():
     results=[]; failed=0
     for fn in (
@@ -383,6 +459,8 @@ def run_scenarios():
         scenario_stale_market_date,
         scenario_tz_unresolvable_fail_closed,
         scenario_missing_tz_fail_closed,
+        scenario_market_ref_fire_allowed,
+        scenario_high_late_evening_skip,
     ):
         r=fn(); results.append(r)
         if not r.get("ok"): failed += 1

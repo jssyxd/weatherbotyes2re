@@ -62,6 +62,12 @@ _LAST_GOOD_TAF: dict[str, dict[str, Any]] = {}
 _DUP_LOG: dict[str, float] = {}
 _DUP_LOG_INTERVAL_S = 300.0
 
+# taf_no_extreme events throttled per ICAO (~10min): a TAF that carries no
+# TX/TN is the silent reason a city has no TAF reference (and would fall back
+# to the market consensus). Ops must see it once per station, not every pull.
+_TAF_NO_EXTREME_LOG: dict[str, float] = {}
+_TAF_NO_EXTREME_LOG_INTERVAL_S = 600.0
+
 
 # --------------------------------------------------------------------------- #
 # Universe + date window
@@ -143,12 +149,22 @@ def refresh_rules(
 
     Index keyed ``city_id|date|direction`` -> rule dict (see
     ``market_adapter.parse_event_rules``). Caches failures by key so a down
-    Gamma doesn't spam the log every tick (retried only at rules TTL)."""
+    Gamma doesn't spam the log every tick (retried only at rules TTL).
+
+    Failure hardening (2026-09-08 KR-egress 451 incident): a full-failure
+    round NEVER wipes a previously-good index — old rules stay usable (the
+    caller still filters non-today dates) so one bad Gamma window cannot blind
+    the whole runner; retries back off instead of storming every cycle.
+    """
     ttl = float(cfg.get("rules_refresh_interval_seconds", DEFAULTS["rules_refresh_interval_seconds"]))
     if time.time() - stamp("rules") < ttl:
-        idx, failures = _load_rule_cache()
+        idx, _ = _load_rule_cache()
         if idx:
-            return idx, failures
+            return idx, _RULE_MEMO["failures"]
+        # Cold cache (nothing usable yet): honour the failure backoff instead
+        # of re-hammering Gamma every cycle.
+        if time.time() < _RULE_MEMO.get("retry_at", 0.0):
+            return {}, _RULE_MEMO["failures"]
     cities_by_icao = {str(c["icao"]).upper(): c for c in cities}
     limited = {icao: cities_by_icao[icao] for icao in dates if icao in cities_by_icao}
     # Generous per-request timeout + deadline: 10 cities × 2 directions × 1 date
@@ -170,12 +186,26 @@ def refresh_rules(
         # sleeve arm never actually entered — 2026-09-06 finding).
         rule["key"] = k
         idx[k] = rule
-    _store_rule_cache(idx, failures)
+    if rules:
+        _store_rule_cache(idx, failures)
+        _RULE_MEMO["retry_at"] = 0.0
+    else:
+        prev_idx, _ = _load_rule_cache()
+        if prev_idx:
+            # Full-failure round with a previously-good index: keep the old
+            # rules usable (caller filters stale dates), surface the current
+            # failures for health/watcher. Next attempt at TTL cadence.
+            _store_rule_cache(prev_idx, failures)
+        else:
+            # Cold start, everything failing: keep empty but back off so the
+            # runner does not storm Gamma every cycle while it is down.
+            _store_rule_cache({}, failures)
+            _RULE_MEMO["retry_at"] = time.time() + 120.0
     bump("rules", time.time())
-    return idx, failures
+    return _RULE_MEMO["idx"], failures
 
 
-_RULE_MEMO: dict[str, Any] = {"idx": {}, "failures": {}}
+_RULE_MEMO: dict[str, Any] = {"idx": {}, "failures": {}, "retry_at": 0.0}
 
 
 def _store_rule_cache(idx: dict[str, Any], failures: dict[str, str]) -> None:
@@ -456,7 +486,9 @@ def _fetch_taf(
     Fail closed: on any error logs ``taf_fetch_failed`` and returns {} so the
     caller keeps last-good TAFs and retries next due cycle. Without a CheckWX
     key TAF is disabled (returns {}) and the strategy falls back to the
-    market-rank-1 consensus reference.
+    market-rank-1 consensus reference. A TAF that parses to no TX/TN logs a
+    throttled ``taf_no_extreme`` event (icao + truncated raw) and is omitted,
+    so ops can see why a city has no TAF reference.
     """
     icaos = sorted({str(i).upper() for i in icaos})
     if not icaos:
@@ -470,6 +502,17 @@ def _fetch_taf(
         for icao, raw in raw_by_icao.items():
             parsed = common.parse_tx_tn(raw)
             if not parsed:
+                # Short/odd TAF with no TX/TN: this city then has NO TAF
+                # reference and the strategy arm/watch falls back to market
+                # consensus — surface why (rate-limited ~10min per ICAO).
+                last = _TAF_NO_EXTREME_LOG.get(icao)
+                if last is None or time.time() - last >= _TAF_NO_EXTREME_LOG_INTERVAL_S:
+                    _TAF_NO_EXTREME_LOG[icao] = time.time()
+                    log_event(cfg.get("log_path"), {
+                        "type": "taf_no_extreme",
+                        "icao": icao,
+                        "raw": raw[:200],
+                    })
                 continue
             issue_dt = common.parse_taf_issue_time(raw, ref_utc=now_utc)
             entry: dict[str, Any] = {
@@ -864,6 +907,8 @@ def _paper_fire(
         "city_id": fire.get("city_id"),
         "icao": fire.get("icao"),
         "market_local_date": fire.get("market_local_date"),
+        "local_fire_time": fire.get("local_fire_time"),
+        "market_unit": fire.get("market_unit"),
         "direction": fire.get("direction"),
         "fires_at_utc": re_execution.iso_utc(now_utc),
         "ref_extreme": fire.get("ref_extreme"),
@@ -891,6 +936,9 @@ def _paper_fire(
             "shares": str(fl["shares"]),
             "avg_price": fl["fill_price"],
             "bucket_id": None,
+            "bucket_lo": leg.get("bucket_lo"),
+            "bucket_hi": leg.get("bucket_hi"),
+            "bucket_label": leg.get("bucket_label"),
             "settled": False,
             "leg_won": None,
         }

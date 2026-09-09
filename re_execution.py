@@ -64,6 +64,22 @@ def plan_leg_attempts(leg, book, target_shares, now_utc, elapsed_ms, budget_ms=F
     if ask is None:
         return {"status": "no_book", "leg": leg.get("leg"), "token_id": token, "cap": str(cap), "elapsed_ms": elapsed_ms, "note": "no_resting_ask_in_ladder"}
     # Ladder: 0ms flat, 1500ms +1 tick, 4000ms still at +1 (cap-bounded)
+    floor_raw = leg.get("floor")
+    floor = _dec(floor_raw) if floor_raw not in (None, "") else None
+    if floor is not None and ask <= floor:
+        # Breakout not confirmed on this rung (ask still under the floor):
+        # skip, do not fill — later rungs retry; if price never enters the
+        # (floor, cap] window the leg simply ends unfilled.
+        return {
+            "status": "below_floor",
+            "leg": leg.get("leg"),
+            "token_id": token,
+            "best_ask": str(ask),
+            "floor": str(floor),
+            "cap": str(cap),
+            "elapsed_ms": elapsed_ms,
+            "note": "breakout_not_confirmed_skip_rung",
+        }
     extra = 0
     if elapsed_ms >= LADDER_MS[1]:
         extra = 1

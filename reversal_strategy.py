@@ -4,10 +4,12 @@ IDLE -> ARMED -> FIRED -> COOLDOWN
 
 Fire only when:
   1) running extreme breaks the reference extreme by exactly one bucket
-     (reference = TAF TX/TN if present, else market rank-1 consensus bucket)
+     (reference = TAF TX/TN when present, else the stable market rank-1
+     consensus bucket — both may fire; allow_market_ref_fire=false closes
+     the market-ref path if London-EGLC-class losses ever recur)
   2) obs is fresh (new obs_time, age <= require_fresh_obs_seconds)
-  3) local hour in fire window
-  4) broken bucket was long-horizon market consensus (1–2h TWAP rank-1)
+  3) local hour in fire window (HIGH 12..18 local, LOW 0..9)
+  4) broken bucket was long-horizon market consensus (1-2h TWAP rank-1)
 
 NO leg on broken bucket is the main trade; YES on new bucket is optional and smaller.
 """
@@ -29,11 +31,15 @@ YES_MAX_ASK = Decimal("0.48")
 NO_NOTIONAL_PCT = Decimal("0.75")
 YES_NOTIONAL_PCT = Decimal("0.25")
 # Fire-window closing 2026-09-08: interval windows, not single edges.
-# HIGH fires only in local 13:00-17:00 (peak afternoons); LOW only in local
+# HIGH fires only in local 13:00-<end> (peak afternoons); LOW only in local
 # 01:00-09:00 (predawn/dawn). Rationale + incidents in CHANGELOG 2026-09-08.
-HIGH_FIRE_LOCAL_START = 13
-HIGH_FIRE_LOCAL_END = 17
-LOW_FIRE_LOCAL_START = 1
+# IANA-local fire windows (2026-09-08 operator decision): HIGH peaks form
+# in the afternoon 12:00-18:00 local; LOW forms 00:00-09:00 local. Anything
+# outside is off-window drift, never the peak-tick reversal we sell. The
+# window is deliberately close to when the daily extreme settles.
+HIGH_FIRE_LOCAL_START = 12
+HIGH_FIRE_LOCAL_HOUR_END = 18
+LOW_FIRE_LOCAL_START = 0
 LOW_FIRE_LOCAL_END = 9
 REQUIRE_FRESH_OBS_SECONDS = 180  # legacy absolute-age gate — deprecated 2026-09-03 (see OBS_* window below)
 OBS_MAX_LOOKBACK_SECONDS = 5400  # 90 min sanity: obs older than this = stale feed, do not fire
@@ -52,6 +58,40 @@ def iso_utc(dt: datetime) -> str:
 def bucket_contains(bucket: dict[str, Any], value: float) -> bool:
     lo, hi = bucket.get("lo"), bucket.get("hi")
     return (lo is None or value >= float(lo)) and (hi is None or value < float(hi))
+
+
+def bucket_label(bucket: dict[str, Any] | None, unit: str = "C") -> str | None:
+    """Human-readable temperature range of a bucket, e.g. 'between 30-31°C'.
+
+    Prefers the bucket's own ``label`` (the original Gamma question wording);
+    falls back to a lo/hi rendering for synthetic buckets that only carry
+    numeric bounds. Returns None for a missing/empty bucket."""
+    if not bucket:
+        return None
+    lbl = bucket.get("label")
+    if lbl:
+        return str(lbl)
+    lo = bucket.get("lo")
+    hi = bucket.get("hi")
+    u = ("°" + str(unit or "C").upper()) if unit else ""
+    if lo is not None and hi is not None:
+        return f"{lo}-{hi}{u}"
+    if lo is not None:
+        return f">={lo}{u}"
+    if hi is not None:
+        return f"<{hi}{u}"
+    return f"?{u}"
+
+
+def _local_fire_time(city: dict[str, Any], now_utc: datetime) -> str | None:
+    """Fire timestamp in the city's own timezone (for readable position rows)."""
+    try:
+        tz = city.get("timezone")
+        if not tz:
+            return None
+        return now_utc.astimezone(ZoneInfo(tz)).isoformat()
+    except Exception:
+        return None
 
 
 def ensure_re_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -186,17 +226,18 @@ def update_running_extreme(state, city_id, market_local_date, direction, temp: f
     return rec
 
 
-def hour_ok(direction, local_hour, high_start, high_end, low_start, low_end) -> bool:
+def hour_ok(direction, local_hour, high_start, high_hour_end, low_start, low_end) -> bool:
     """Inclusive local-hour window gate (2026-09-08 interval semantics).
 
-    HIGH: high_start <= local_hour <= high_end (default 13..17).
+    HIGH: high_start <= local_hour <= high_hour_end (13..cfg ceiling — e.g.
+    17; a 18:25-local London-class break is hour 18 and is rejected).
     LOW:  low_start  <= local_hour <= low_end  (default 1..9).
     Fire away from the window in which the daily extreme actually forms —
     a break observed at 02:00 (mexico-city low) or 03:00 (SF high, off-window)
     is off-peak drift, not the capped peak-tick reversal this strategy sells.
     """
     if direction == "high":
-        return local_hour >= high_start and local_hour <= high_end
+        return local_hour >= high_start and local_hour <= high_hour_end
     return local_hour >= low_start and local_hour <= low_end
 
 
@@ -268,7 +309,12 @@ def maybe_arm_or_fire(
     obs_lookback_s = int(cfg.get("max_obs_lookback_seconds", OBS_MAX_LOOKBACK_SECONDS))
     obs_future_s = int(cfg.get("max_obs_future_seconds", OBS_MAX_FUTURE_SECONDS))
     high_start = int(cfg.get("high_fire_local_start", HIGH_FIRE_LOCAL_START))
-    high_end = int(cfg.get("high_fire_local_end", HIGH_FIRE_LOCAL_END))
+    # HIGH upper bound: new key high_fire_local_hour_end first, legacy
+    # high_fire_local_end for configs not yet migrated, module ceiling last.
+    _high_hour_end = cfg.get("high_fire_local_hour_end")
+    if _high_hour_end is None:
+        _high_hour_end = cfg.get("high_fire_local_end", HIGH_FIRE_LOCAL_HOUR_END)
+    high_hour_end = int(_high_hour_end)
     low_start = int(cfg.get("low_fire_local_start", LOW_FIRE_LOCAL_START))
     low_end = int(cfg.get("low_fire_local_end", LOW_FIRE_LOCAL_END))
     cons_win = int(cfg.get("consensus_window_seconds", CONSENSUS_WINDOW_SECONDS))
@@ -276,6 +322,9 @@ def maybe_arm_or_fire(
     cons_min_lead = Decimal(str(cfg.get("consensus_min_lead", CONSENSUS_MIN_LEAD)))
     require_consensus = bool(cfg.get("require_consensus_filter", True))
     allow_market_ref = bool(cfg.get("allow_market_consensus_reference", True))
+    # market-rank-1 fires are allowed (stable-consensus break is the edge);
+    # config allow_market_ref_fire=false is the kill-switch if it regresses.
+    allow_market_ref_fire = bool(cfg.get("allow_market_ref_fire", True))
 
     tracker = consensus_tracker or DEFAULT_TRACKER
     tree = ensure_re_state(state)
@@ -397,7 +446,7 @@ def maybe_arm_or_fire(
     jump = run_i - taf_i if direction == "high" else taf_i - run_i
 
     armed = tree["armed"].get(key)
-    if jump <= 0 and distance_c <= arm_c and hour_ok(direction, local_hour, high_start, high_end, low_start, low_end):
+    if jump <= 0 and distance_c <= arm_c and hour_ok(direction, local_hour, high_start, high_hour_end, low_start, low_end):
         tree["armed"][key] = {
             "status": "armed",
             "taf_bucket_id": str(taf_b.get("bucket_id") or taf_b.get("id") or ""),
@@ -455,7 +504,7 @@ def maybe_arm_or_fire(
                          "jump": jump, "run_whole_f": run_w, "bucket_lo": b_lo, "margin_f": margin_f}]
 
     # jump > 0 : potential break
-    if not hour_ok(direction, local_hour, high_start, high_end, low_start, low_end):
+    if not hour_ok(direction, local_hour, high_start, high_hour_end, low_start, low_end):
         return [{"action_type": "re_skip", "reason": "hour_not_in_window", "key": key, "jump": jump}]
     # Freshness = "a NEW observation arrived" (deduped by is_new_obs_time
     # above) — NOT "the observation happened within N seconds". METAR/SPECI
@@ -512,6 +561,15 @@ def maybe_arm_or_fire(
         return [{"action_type": "re_skip", "reason": "break_without_arm",
                  "key": key, "jump": jump,
                  "ref_source": ref_source, "ever_armed": bool(ever)}]
+
+    # market-rank-1 fire path (config-gated). 2026-09-08 London EGLC lossed
+    # when a market-rank-1 reference fired on a transient late obs; but
+    # blocking market-ref fires outright also kills the stable-consensus
+    # break (Paris 27°C / Milan 32°C both won exactly that way). Default
+    # open; set allow_market_ref_fire=false to fail closed again.
+    if ref_source != "taf" and not allow_market_ref_fire:
+        return [{"action_type": "re_skip", "reason": "market_ref_fire_disabled",
+                 "key": key, "jump": jump, "ref_source": ref_source}]
 
     # Long-horizon consensus filter on the *broken* bucket
     consensus_meta: dict[str, Any] = {"ok": True, "reason": "disabled"}
@@ -602,6 +660,8 @@ def maybe_arm_or_fire(
         "city_id": city["city_id"],
         "icao": city.get("icao"),
         "market_local_date": market_local_date,
+        "local_fire_time": _local_fire_time(city, now_utc),
+        "market_unit": str(city.get("market_unit") or "C").upper(),
         "direction": direction,
         "ref_extreme": float(ref_extreme),
         "ref_source": ref_source,
@@ -624,6 +684,10 @@ def maybe_arm_or_fire(
             "outcome": "NO",
             "cap": str(cfg.get("no_max_ask", NO_MAX_ASK)),
             "notional_pct": str(cfg.get("no_notional_pct", NO_NOTIONAL_PCT)),
+            "floor": str(cfg.get("no_min_ask") or ""),
+            "bucket_lo": broken.get("lo"),
+            "bucket_hi": broken.get("hi"),
+            "bucket_label": bucket_label(broken, unit),
         })
     if fire_yes and new_b is not None:
         fire["legs"].append({
@@ -633,6 +697,10 @@ def maybe_arm_or_fire(
             "outcome": "YES",
             "cap": str(cfg.get("yes_max_ask", YES_MAX_ASK)),
             "notional_pct": str(cfg.get("yes_notional_pct", YES_NOTIONAL_PCT)),
+            "floor": str(cfg.get("yes_min_ask") or ""),
+            "bucket_lo": new_b.get("lo"),
+            "bucket_hi": new_b.get("hi"),
+            "bucket_label": bucket_label(new_b, unit),
         })
     # Bug 3 — third lock, write side: stamp the exact obs_time this fire
     # was dispatched on. Future cycles on the same key use this to reject
