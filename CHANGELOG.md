@@ -1,5 +1,73 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-09 — Same-session double fire (追火) with symmetric NO+YES legs (da12518)
+
+- **A market key (city|date|direction) may now fire at most TWICE per day.**
+  Warsaw 2026-09-09 LOW 17→16→15 double break (operator decision, 2026-09-09):
+  fire #1 bought YES on 16°C when the reference broke 17→16; temperature then
+  fell through to 15°C and the 16°C YES was headed to zero with no further
+  action possible under the old one-shot `already_fired` lock.
+  New rule:
+  - Fire #1 unchanged. After it, the session stays eligible for ONE 追火 when a
+    fresh obs (age ≤ 180s) breaks ONE bucket past the YES bucket fire #1
+    actually bought (reference — TAF or consensus rank-1 — having ratcheted
+    onto that bucket first), with every gate identical to fire #1: jump=1,
+    local fire window (HIGH 13-17 / LOW 1-9), consensus filter, YES price gate
+    `(yes_min_ask, yes_max_ask]`.
+  - 追火 leg structure is symmetric with fire #1: `buy_no_broken` on the
+    newly-broken bucket (= the bucket fire #1 holds YES in; its NO is priced
+    ~1 by then — placed per operator decision, cap 1.0) + `buy_yes_new` on the
+    new bucket YES.
+  - On 追火 fill, fire #1's old-bucket YES leg is sold at best_bid (shared
+    `close_leg_at_best_bid` in `paper_capital.py`, same mode as sleeve-timeout
+    closes; no bid → written off at 0, the new NO leg hedges).
+  - Breaks past fire #2 take no further action (`fires >= 2` → `already_fired`).
+  - `fires` counter persisted in each `fired` record; legacy records (no
+    `fires` field) migrate as "1 used" — an old fired key may still 追火 once,
+    but eligibility requires an open un-settled YES leg with shares, so pure
+    lock/no-fill records stay inert.
+  - Events: `fire` carries `fire_no` 1/2; new `close_old_yes` event logs
+    shares / bid_at_close / proceeds_usdc / loss_usdc for the liquidation.
+- Verified: `tests_reversal.py` 24/24 PASS (incl. refire_above_cap,
+  refire_out_of_window, refire_persists_across_restart, warsaw-style
+  two-branch close scenarios), sleeve 13+4, `tests_fill_gate.py` 6,
+  `paper_reversal_sim.py --scenarios-only` exit 0. Dual herdr agent review
+  (impl + independent audit) APPROVED. Deployed 2026-09-09 21:3x CST.
+- Deployed on 192.168.1.98 (本机) with the account still at 500 USDC paper
+  (config initial capital intentionally 600 per operator — takes effect on the
+  next blank-state rebuild; the live guard never rewrites a trading account).
+
+## 2026-09-09 — YES/NO leg fill floor; TAF AMD fix; market-ref fire gate; rules-refresh hardening (f5318c7)
+
+- **Optional YES-leg fill floor** (`plan_leg_attempts`): ladder rungs are
+  skipped while `best_ask <= leg.floor` (breakout not yet confirmed), aborted
+  above cap as before, traded only inside `(floor, cap]`.
+  `re_execution.py` + `tests_fill_gate.py`. Config: `yes_max_ask` 1.0 → 0.9,
+  new `yes_min_ask` 0.48. (YES bought at ~0.91 / 0.945 / 0.99 in the 9/8–9/9
+  fires was structurally too expensive — gate now caps the entry.)
+- **TAF AMD/COR/RTD key fix** (`research/common.py` `checkwx_taf`): amended
+  TAFs like `TAF AMD EGLC ...` were keyed under `out["AMD"]`, silently losing
+  the TAF reference for that airport (London case: reference fell back to
+  market rank-1 and the bot traded against the market). Corrector markers are
+  now skipped and the real ICAO is always the key; multi-line TAF bodies
+  handled.
+- **`taf_no_extreme` event**: a TAF with no parseable TX/TN now logs a
+  rate-limited per-ICAO event instead of failing silently (fail-closed
+  semantics unchanged).
+- **Market-ref fire gate**: `allow_market_ref_fire` config key makes
+  fire-on-market-rank-1-reference optional; TAF-sourced sessions unaffected.
+  HIGH direction gained an upper local-hour bound (late-evening off-window
+  fires suppressed).
+- **Rules-refresh failure hardening** (`_r_cycle.refresh_rules`, 2026-09-08
+  KR-egress 451 incident): a full-failure round NEVER wipes the previously
+  good rules index (old rules stay usable; caller filters non-today dates) and
+  cold-start failures back off 120 s instead of storming Gamma every cycle
+  (~6 900 wasted refreshes observed 2026-09-08). Prior-art reference:
+  polymarket-market-data skill gamma-refresh-failure-diagnosis.
+- Verified: `tests_reversal.py` incl. `market_ref_fire_allowed` /
+  `high_late_evening_skip`, sleeve tests, fill-gate 6 — all green. Deployed
+  with the double-fire change.
+
 ## 2026-09-08 — Fire-window intervalization (HIGH 13-17 / LOW 1-9 local)
 
 - **`reversal_strategy.py` fire window switched from single-edge bounds to
