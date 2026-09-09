@@ -9,8 +9,11 @@ No real money, no wallet, no CLOB credentials, no order submission.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
+
+ZERO = Decimal("0")
 
 DEFAULT_INITIAL_CAPITAL_USDC = Decimal("1000.00")
 
@@ -88,3 +91,60 @@ def release(state: dict[str, Any], amount_usdc: Any) -> Decimal:
     state["paper_total_debit_usdc"] = float(new_total)
     return new_total
 
+
+
+def close_leg_at_best_bid(
+    state: dict[str, Any],
+    leg: dict[str, Any],
+    books: dict[str, Any] | None = None,
+    *,
+    closed_by: str = "paper_close",
+    settled_at_utc: str | None = None,
+) -> dict[str, Any] | None:
+    """Sell one open paper leg at its current best bid (paper close).
+
+    Shared close for the B2 sleeve-timeout path and the second-fire (追火)
+    old-bucket YES liquidation (2026-09-09): proceeds = best_bid x shares are
+    released back to the pool; when the token has no book / no bid the leg is
+    written off at 0. Marks the leg settled (``leg_won`` False, ``closed_by``,
+    proceeds). ``books`` maps token_id -> ladder dict ({best_bid, ...}); a
+    missing token means no bid. Returns a summary dict {shares, bid,
+    proceeds_usdc} or None when the leg was already settled / holds no shares.
+    """
+    if leg is None or leg.get("settled"):
+        return None
+    try:
+        shares = Decimal(str(leg.get("shares") or 0))
+    except Exception:  # noqa: BLE001
+        shares = ZERO
+    if shares <= ZERO:
+        return None
+    tok = str(leg.get("token_id") or "")
+    book = (books or {}).get(tok)
+    bid = book.get("best_bid") if book else None
+    proceeds = ZERO
+    if bid is not None:
+        try:
+            bid_d = Decimal(str(bid))
+            if bid_d > ZERO:
+                proceeds = (bid_d * shares).quantize(Decimal("0.0001"))
+        except Exception:  # noqa: BLE001
+            proceeds = ZERO
+    if proceeds > ZERO:
+        release(state, proceeds)
+    leg["settled"] = True
+    leg["leg_won"] = False
+    leg["closed_by"] = closed_by
+    leg["close_proceeds_usdc"] = str(proceeds)
+    # Equity accounts every settled leg as payout - cost; the release already
+    # returned proceeds to the pool, so mirror them here as the leg's payout.
+    leg["payout_credit_usdc"] = str(proceeds)
+    leg["bid_at_close"] = str(bid) if bid is not None else None
+    if settled_at_utc is None:
+        settled_at_utc = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    leg["settled_at_utc"] = settled_at_utc
+    return {
+        "shares": str(shares),
+        "bid": str(bid) if bid is not None else None,
+        "proceeds_usdc": str(proceeds),
+    }

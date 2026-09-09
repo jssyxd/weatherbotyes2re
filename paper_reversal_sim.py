@@ -17,6 +17,7 @@ from reversal_strategy import (
     maybe_arm_or_fire,
     ensure_re_state,
     prune_stale_sessions,
+    session_key,
 )
 from consensus_tracker import ConsensusTracker
 TZ = "Asia/Shanghai"
@@ -461,6 +462,12 @@ def run_scenarios():
         scenario_missing_tz_fail_closed,
         scenario_market_ref_fire_allowed,
         scenario_high_late_evening_skip,
+        scenario_refire_closes_old_yes,
+        scenario_refire_close_no_bid,
+        scenario_refire_below_floor,
+        scenario_refire_above_cap,
+        scenario_refire_out_of_window,
+        scenario_refire_persists_across_restart,
     ):
         r=fn(); results.append(r)
         if not r.get("ok"): failed += 1
@@ -507,5 +514,417 @@ def main():
     if failed: raise SystemExit(1)
 
 
-if __name__=="__main__":
+def make_fire_position(key, fire, fills, budget_usdc, now):
+    """Position record shaped like ``_r_cycle._paper_fire`` output (used to
+    seed fire #1's ledger row / build fire #2's row for the 追火 scenarios)."""
+    legs = []
+    for fleg in fire.get("legs", []):
+        name = str(fleg.get("leg"))
+        fl = fills.get(name) or {}
+        shares = Decimal(str(fl.get("shares") or 0))
+        if shares <= 0:
+            continue
+        legs.append({
+            "leg": name,
+            "token_id": fleg.get("token_id"),
+            "side": fleg.get("side"),
+            "outcome": fleg.get("outcome"),
+            "cap": fleg.get("cap"),
+            "notional_pct": fleg.get("notional_pct"),
+            "cost_usdc": str(fl.get("cost") or 0),
+            "shares": str(shares),
+            "avg_price": str(fl.get("avg_price")) if fl.get("avg_price") is not None else None,
+            "bucket_id": (fire.get("broken_bucket_id") if name == "buy_no_broken" else fire.get("new_bucket_id")),
+            "bucket_lo": fleg.get("bucket_lo"),
+            "bucket_hi": fleg.get("bucket_hi"),
+            "bucket_label": fleg.get("bucket_label"),
+            "settled": False,
+            "leg_won": None,
+        })
+    return {
+        "key": key,
+        "kind": "reversal",
+        "city_id": fire.get("city_id"),
+        "icao": fire.get("icao"),
+        "market_local_date": fire.get("market_local_date"),
+        "local_fire_time": fire.get("local_fire_time"),
+        "market_unit": fire.get("market_unit"),
+        "direction": fire.get("direction"),
+        "fires_at_utc": iso_utc(now),
+        "ref_extreme": fire.get("ref_extreme"),
+        "ref_source": fire.get("ref_source"),
+        "running_extreme": fire.get("running_extreme"),
+        "jump": fire.get("jump"),
+        "budget_usdc": str(budget_usdc),
+        "settled": False,
+        "legs": legs,
+    }
+
+
+
+REFIRE_CFG = dict(PAPER_CFG)
+REFIRE_CFG.update({"yes_max_ask": "0.9", "yes_min_ask": "0.48", "no_max_ask": "1.0"})
+
+
+def make_tall_buckets():
+    """Extended bucket ladder h29..h37 for the 追火 scenarios (make_buckets
+    only goes to h35 — the third-break obs must still map to a bucket)."""
+    out = []
+    for t in range(29, 38):
+        out.append({"bucket_id": f"h{t}", "lo": float(t), "hi": float(t + 1),
+                    "no_token_id": f"NO-{t}", "yes_token_id": f"YES-{t}"})
+    return out
+
+
+def _set_debit(state, amount):
+    state["paper_total_debit_usdc"] = float(Decimal(str(amount)).quantize(Decimal("0.00001")))
+
+
+def _debit(state):
+    return Decimal(str(state["paper_total_debit_usdc"] or 0))
+
+
+def _low_rule_books(asks):
+    """books dict (token -> ladder) for consensus sampling / fills."""
+    return {tok: make_book(ask, depth=6) for tok, ask in asks.items()}
+
+
+def _refire_setup():
+    """Build a shanghai HIGH session about to fire #1.
+
+    Rank-1 ladder h34 -> h35 -> h36 (each seedable cleanly: h34/h35 are NOT
+    among the h30/h32/h33 buckets that ``seed_consensus_rank1`` double-records
+    at identical timestamps, which would zero-weight their top samples).
+    Fire #1 = obs 35.5 breaks h34 -> buys YES h35 (+ NO h34). Local times are
+    Shanghai 13:00-17:00, inside the HIGH window 12-18.
+    """
+    cfg = REFIRE_CFG
+    date = "2026-09-10"
+    state = {"paper_initial_capital_usdc": 100.0, "paper_total_debit_usdc": 0.0,
+             "entry_count": 0, "positions": {}, "weatherbotyes2re": {}}
+    ensure_re_state(state)
+    city = make_city()  # shanghai, UTC+8
+    buckets = make_tall_buckets()
+    key = session_key(city["city_id"], date, "high")
+    tracker = ConsensusTracker(min_samples=3)
+    t0 = datetime(2026, 9, 10, 5, 0, tzinfo=timezone.utc)  # 13:00 local, hour 13
+    seed_consensus_rank1(tracker, city, date, "high", "h34", t0)
+    books34 = _low_rule_books({"YES-34": 0.55})
+    a0 = maybe_arm_or_fire(state, city, date, "high", buckets, None, 34.4, t0, t0, books34, cfg, tracker)
+    if not any(a.get("action_type") == "re_arm" for a in a0):
+        raise AssertionError(f"no arm: {[a.get('reason') for a in a0]}")
+    t1 = datetime(2026, 9, 10, 5, 20, tzinfo=timezone.utc)  # 13:20 local
+    a1 = maybe_arm_or_fire(state, city, date, "high", buckets, None, 35.5, t1, t1, books34, cfg, tracker)
+    fire1 = next((a for a in a1 if a.get("action_type") == "re_fire"), None)
+    if fire1 is None:
+        raise AssertionError(f"fire #1 missing: {[a.get('reason') for a in a1]}")
+    if not (fire1.get("fire_no") == 1 and fire1.get("new_bucket_id") == "h35"
+            and fire1.get("broken_bucket_id") == "h34"):
+        raise AssertionError(f"bad fire1: no={fire1.get('fire_no')} nb={fire1.get('new_bucket_id')}")
+    books1 = _low_rule_books({"NO-34": 0.40, "YES-35": 0.50})
+    fills1, _, log1 = run_fire_window(fire1, books1, Decimal("20"), t1, scramble=False)
+    if Decimal(str(fills1["buy_yes_new"]["shares"])) <= 0:
+        raise AssertionError("fire #1 YES must fill")
+    _set_debit(state, fills1["buy_no_broken"]["cost"] + fills1["buy_yes_new"]["cost"])
+    state["positions"][key] = make_fire_position(key, fire1, fills1, Decimal("20"), t1)
+    tree = ensure_re_state(state)
+    if tree["fired"][key].get("fires") != 1:
+        raise AssertionError(tree["fired"][key])
+    return state, tracker, city, buckets, key, t1
+
+
+def _refire_obs(tracker, state, city, buckets, key, cfg, date, at, obs, seed_top, seed_ask):
+    """Eligible 追火 break: rank-1 ratcheted to ``seed_top``, fresh obs ``obs``
+    one bucket beyond it (direction already implied by the market). Returns the
+    strategy action list."""
+    seed_consensus_rank1(tracker, city, date, "high", seed_top, at)
+    return maybe_arm_or_fire(state, city, date, "high", buckets, None, obs, at, at,
+                             _low_rule_books({f"YES-{seed_top[1:]}": seed_ask}), cfg, tracker)
+
+
+def scenario_refire_closes_old_yes():
+    """(a) mainline: peak keeps climbing; second break h35 (rank-1 ratcheted
+    to h35) -> 追火 buys YES h36 AND the cycle liquidates fire #1's old YES
+    h35 leg at best_bid; a third break (fires==2) takes no action."""
+    cfg = REFIRE_CFG
+    date = "2026-09-10"
+    state, tracker, city, buckets, key, t1 = _refire_setup()
+    old_yes = next(lg for lg in state["positions"][key]["legs"] if lg["outcome"] == "YES")
+    if old_yes["bucket_id"] != "h35":
+        return {"name": "refire_closes_old_yes", "ok": False, "error": "old_bucket",
+                "old_bucket": old_yes["bucket_id"]}
+    old_shares = Decimal(str(old_yes["shares"]))
+    # --- fire #2 obs: 36.4 breaks h35 (consensus rank-1 ratcheted to h35) ---
+    t2 = datetime(2026, 9, 10, 7, 40, tzinfo=timezone.utc)  # 15:40 local, in window
+    a2 = _refire_obs(tracker, state, city, buckets, key, cfg, date, t2, 36.4, "h35", 0.55)
+    fire2 = next((a for a in a2 if a.get("action_type") == "re_fire"), None)
+    if fire2 is None:
+        return {"name": "refire_closes_old_yes", "ok": False,
+                "error": "no_fire2", "reasons": [a.get("reason") for a in a2],
+                "types": [a.get("action_type") for a in a2]}
+    legs2 = fire2.get("legs") or []
+    leg_by = {str(l.get("leg")): l for l in legs2}
+    if not (fire2.get("fire_no") == 2 and fire2.get("refire") is True
+            and sorted(leg_by) == ["buy_no_broken", "buy_yes_new"]
+            and leg_by["buy_no_broken"].get("outcome") == "NO"
+            and leg_by["buy_no_broken"].get("token_id") == "NO-35"
+            and leg_by["buy_yes_new"].get("outcome") == "YES"
+            and leg_by["buy_yes_new"].get("token_id") == "YES-36"
+            and fire2.get("new_bucket_id") == "h36"
+            and fire2.get("broken_bucket_id") == "h35"
+            and str(leg_by["buy_no_broken"].get("cap")) == str(cfg["no_max_ask"])
+            and str(leg_by["buy_yes_new"].get("cap")) == str(cfg["yes_max_ask"])):
+        # caps come from the same cfg keys as fire #1, so the refire NO/YES
+        # legs are sized by size_legs exactly like fire #1's legs.
+        return {"name": "refire_closes_old_yes", "ok": False,
+                "error": "bad_fire2_legs", "legs": legs2, "fire_no": fire2.get("fire_no"),
+                "new_bucket_id": fire2.get("new_bucket_id"), "broken": fire2.get("broken_bucket_id"),
+                "refire": fire2.get("refire")}
+    fills2, _, log2 = run_fire_window(fire2, _low_rule_books({"NO-35": 0.95, "YES-36": 0.52}), Decimal("20"), t2, scramble=False)
+    if Decimal(str(fills2["buy_yes_new"]["shares"])) <= 0:
+        return {"name": "refire_closes_old_yes", "ok": False, "error": "fire2_no_fill", "fills": fills2}
+    if Decimal(str(fills2["buy_no_broken"]["shares"])) <= 0:
+        return {"name": "refire_closes_old_yes", "ok": False, "error": "fire2_no_no_fill", "fills": fills2}
+    _set_debit(state, _debit(state) + fills2["buy_yes_new"]["cost"] + fills2["buy_no_broken"]["cost"])
+    pos2 = make_fire_position(key, fire2, fills2, Decimal("20"), t2)
+    # --- cycle-side close: old YES h35 has a live bid of 0.08 ---
+    from _r_cycle import record_refire
+    import _r_globals
+    bid = Decimal("0.08")
+    _r_globals._BOOK_CACHE = {"YES-35": {"best_bid": str(bid), "bids": [{"price": str(bid), "size": "99"}]}}
+    cfg_cycle = {"log_path": "/tmp/refire_close_old_yes.jsonl"}
+    debit_before = _debit(state)
+    record_refire(cfg_cycle, state, fire2, pos2, log2, t2)
+    position = state["positions"][key]
+    old_settled = next(
+        lg for lg in position["legs"]
+        if lg.get("outcome") == "YES" and lg.get("settled") and lg.get("bucket_id") == "h35"
+    )
+    refire_yes = next(
+        lg for lg in position["legs"]
+        if lg.get("outcome") == "YES" and not lg.get("settled") and lg.get("bucket_id") == "h36"
+    )
+    refire_no = next(
+        lg for lg in position["legs"]
+        if lg.get("outcome") == "NO" and not lg.get("settled") and lg.get("bucket_id") == "h35"
+    )
+    old_no_kept = next(
+        lg for lg in position["legs"]
+        if lg.get("outcome") == "NO" and not lg.get("settled") and lg.get("bucket_id") == "h34"
+    )
+    exp_proceeds = (bid * old_shares).quantize(Decimal("0.0001"))
+    debit_after = _debit(state)
+    checks = {
+        "old_yes_settled": old_settled.get("settled") is True
+        and old_settled.get("closed_by") == "refire_liquidation",
+        "proceeds": Decimal(str(old_settled.get("close_proceeds_usdc"))) == exp_proceeds,
+        "debit_released": debit_after == (debit_before - exp_proceeds),
+        "refire_yes_merged": refire_yes is not None and Decimal(str(refire_yes["shares"])) > 0,
+        "refire_no_merged": refire_no is not None and Decimal(str(refire_no["shares"])) > 0,
+        "fires_is_two": ensure_re_state(state)["fired"][key].get("fires") == 2,
+        "old_no_kept": old_no_kept is not None and not old_no_kept.get("settled"),
+    }
+    ok = all(checks.values())
+    if not ok:
+        return {"name": "refire_closes_old_yes", "ok": False, "checks": checks,
+                "legs": [(lg.get("leg"), lg.get("outcome"), lg.get("bucket_id"), lg.get("settled"), lg.get("shares")) for lg in position["legs"]],
+                "debit_before": str(debit_before),
+                "debit_after": str(debit_after), "exp_proceeds": str(exp_proceeds)}
+    # --- third break: fires==2 -> already_fired, no action ---
+    t3 = datetime(2026, 9, 10, 9, 0, tzinfo=timezone.utc)
+    a3 = _refire_obs(tracker, state, city, buckets, key, cfg, date, t3, 37.3, "h36", 0.55)
+    third = not any(a.get("action_type") == "re_fire" for a in a3) and any(a.get("reason") == "already_fired" for a in a3)
+    return {"name": "refire_closes_old_yes", "ok": ok and third,
+            "checks": checks, "third_break_blocked": third,
+            "fires": ensure_re_state(state)["fired"][key].get("fires")}
+
+
+def scenario_refire_close_no_bid():
+    """(a) no-bid branch: fire #1's old YES h35 has NO book/bid when the 追火
+    fills -> old leg written off at 0 (still marked settled), no cash release."""
+    cfg = REFIRE_CFG
+    date = "2026-09-10"
+    state, tracker, city, buckets, key, t1 = _refire_setup()
+    t2 = datetime(2026, 9, 10, 7, 40, tzinfo=timezone.utc)
+    a2 = _refire_obs(tracker, state, city, buckets, key, cfg, date, t2, 36.4, "h35", 0.55)
+    fire2 = next((a for a in a2 if a.get("action_type") == "re_fire"), None)
+    if fire2 is None:
+        return {"name": "refire_close_no_bid", "ok": False, "reasons": [a.get("reason") for a in a2]}
+    # NO-35 (newly-broken bucket NO) has NO book here -> no_book branch; the
+    # YES-36 leg fills. Old YES h35 has no bid -> written off at 0.
+    fills2, _, log2 = run_fire_window(fire2, _low_rule_books({"YES-36": 0.52}), Decimal("20"), t2, scramble=False)
+    no_no_fill = Decimal(str(fills2["buy_no_broken"]["shares"])) == 0
+    yes_filled = Decimal(str(fills2["buy_yes_new"]["shares"])) > 0
+    _set_debit(state, _debit(state) + fills2["buy_yes_new"]["cost"])
+    pos2 = make_fire_position(key, fire2, fills2, Decimal("20"), t2)
+    from _r_cycle import record_refire
+    import _r_cycle as _cycle_mod
+    import _r_globals
+    _r_globals._BOOK_CACHE = {}  # old YES token: no book -> no bid -> write off 0
+    # record_refire refreshes a missing old-token book once before closing —
+    # stub the refresh (no network in the scenario) so it stays unavailable.
+    _orig_refresh = _cycle_mod.refresh_books
+    _cycle_mod.refresh_books = lambda cfg, toks, now: {}
+    cfg_cycle = {"log_path": "/tmp/refire_close_no_bid.jsonl"}
+    debit_before = _debit(state)
+    try:
+        record_refire(cfg_cycle, state, fire2, pos2, log2, t2)
+    finally:
+        _cycle_mod.refresh_books = _orig_refresh
+    old_settled = next(
+        lg for lg in state["positions"][key]["legs"]
+        if lg.get("outcome") == "YES" and lg.get("settled") and lg.get("bucket_id") == "h35"
+    )
+    no_leg_no_book = any(
+        i.get("leg") == "buy_no_broken" and i.get("status") == "no_book" for i in log2
+    )
+    checks = {
+        "no_leg_tried_no_book": no_no_fill and no_leg_no_book,
+        "yes_leg_filled": yes_filled,
+        "old_yes_settled_at_zero": old_settled.get("settled") is True
+        and Decimal(str(old_settled.get("close_proceeds_usdc") or 0)) == 0,
+        "no_release": _debit(state) == debit_before,
+        "bid_none": old_settled.get("bid_at_close") is None,
+    }
+    return {"name": "refire_close_no_bid", "ok": all(checks.values()), "checks": checks,
+            "old_settled": old_settled}
+
+
+def _refire_price_case(ask, label):
+    cfg = REFIRE_CFG
+    date = "2026-09-10"
+    state, tracker, city, buckets, key, t1 = _refire_setup()
+    t2 = datetime(2026, 9, 10, 7, 40, tzinfo=timezone.utc)
+    a2 = _refire_obs(tracker, state, city, buckets, key, cfg, date, t2, 36.4, "h35", 0.55)
+    fire2 = next((a for a in a2 if a.get("action_type") == "re_fire"), None)
+    if fire2 is None:
+        return {"name": label, "ok": False, "reasons": [a.get("reason") for a in a2]}
+    # Only the YES-36 book is provided at the gate price; the NO-35 leg has no
+    # book and the YES leg is gated (below floor / above cap) -> no fill.
+    fills2, _, log2 = run_fire_window(fire2, _low_rule_books({"YES-36": ask}), Decimal("20"), t2, scramble=False)
+    # no fill -> record_refire must NOT liquidate the old YES leg
+    from _r_cycle import record_refire
+    import _r_globals
+    _r_globals._BOOK_CACHE = {"YES-35": {"best_bid": "0.08", "bids": [{"price": "0.08", "size": "99"}]}}
+    pos2 = make_fire_position(key, fire2, fills2, Decimal("20"), t2)
+    record_refire({"log_path": f"/tmp/refire_{label}.jsonl"}, state, fire2, pos2, log2, t2)
+    refilled = Decimal(str(fills2.get("buy_yes_new", {}).get("shares") or 0))
+    old_unsettled = next(
+        lg for lg in state["positions"][key]["legs"]
+        if lg.get("outcome") == "YES" and lg.get("bucket_id") == "h35"
+    )["settled"] is not True
+    return {"name": label, "ok": refilled == 0 and old_unsettled
+            and ensure_re_state(state)["fired"][key].get("fires") == 2,
+            "filled_shares": str(refilled),
+            "ask": ask,
+            "ladder_statuses": sorted({i.get("status") for i in log2}),
+            "old_yes_kept_open": old_unsettled}
+
+
+def scenario_refire_below_floor():
+    """(b) price gate: 追火 YES ask below yes_min_ask (0.48) = break NOT
+    confirmed -> refire leg never fills, old YES leg kept."""
+    return _refire_price_case(0.30, "refire_below_floor")
+
+
+def scenario_refire_above_cap():
+    """(b) price gate: 追火 YES ask above yes_max_ask (0.9) -> FAK aborts,
+    no chase, old YES leg kept."""
+    return _refire_price_case(0.95, "refire_above_cap")
+
+
+def scenario_refire_out_of_window():
+    """(c) window gate: the second break arrives at local hour 19 (HIGH window
+    ends 18) -> hour_not_in_window, no re_fire, fires stays 1 (slot kept)."""
+    cfg = REFIRE_CFG
+    date = "2026-09-10"
+    state, tracker, city, buckets, key, t1 = _refire_setup()
+    t2 = datetime(2026, 9, 10, 11, 0, tzinfo=timezone.utc)  # 19:00 local -> out of window
+    a2 = _refire_obs(tracker, state, city, buckets, key, cfg, date, t2, 36.4, "h35", 0.55)
+    fires2 = [a for a in a2 if a.get("action_type") == "re_fire"]
+    reasons = [a.get("reason") for a in a2]
+    ok = (not fires2 and "hour_not_in_window" in reasons
+          and ensure_re_state(state)["fired"][key].get("fires") == 1)
+    return {"name": "refire_out_of_window", "ok": ok,
+            "types": [a.get("action_type") for a in a2], "reasons": reasons,
+            "fires": ensure_re_state(state)["fired"][key].get("fires")}
+
+
+def scenario_refire_persists_across_restart():
+    """(d) fire_count persistence: a fires==1 key may 追火 once after a
+    restart (state round-trip via deepcopy); fires==2 blocks everything. A
+    LEGACY fired record (no fires field) is treated as 1 fire used."""
+    cfg = REFIRE_CFG
+    date = "2026-09-10"
+    city = make_city()
+    buckets = make_tall_buckets()
+    key = session_key(city["city_id"], date, "high")
+
+    def leg(leg_name, bucket, shares):
+        return {"leg": leg_name, "token_id": f"YES-{bucket[1:]}", "side": "BUY",
+                "outcome": "YES", "cap": "0.9", "notional_pct": "0.75",
+                "cost_usdc": "5", "shares": str(shares), "avg_price": "0.5",
+                "bucket_id": bucket, "settled": False, "leg_won": None}
+
+    def run_stage(state, tracker, obs, at, seed_top, seed_ask):
+        return _refire_obs(tracker, state, city, buckets, key, cfg, date, at, obs, seed_top, seed_ask)
+
+    # --- modern: fire #1 -> fires==1; restart; eligible break -> fires==2 ---
+    state = {"paper_initial_capital_usdc": 100.0, "paper_total_debit_usdc": 0.0,
+             "entry_count": 0, "positions": {}, "weatherbotyes2re": {}}
+    ensure_re_state(state)
+    tracker = ConsensusTracker(min_samples=3)
+    t0 = datetime(2026, 9, 10, 5, 0, tzinfo=timezone.utc)
+    seed_consensus_rank1(tracker, city, date, "high", "h34", t0)
+    maybe_arm_or_fire(state, city, date, "high", buckets, None, 34.4, t0, t0,
+                      _low_rule_books({"YES-34": 0.55}), cfg, tracker)
+    t1 = datetime(2026, 9, 10, 5, 20, tzinfo=timezone.utc)
+    a1 = run_stage(state, tracker, 35.5, t1, "h34", 0.55)
+    fire1 = next(a for a in a1 if a.get("action_type") == "re_fire")
+    c1 = fire1.get("fire_no") == 1 and ensure_re_state(state)["fired"][key].get("fires") == 1
+    # restart (persisted blob round-trip)
+    state2 = deepcopy(state)
+    # a real fire #1 created an open position holding YES h35 — seed it (as
+    # the cycle would have) so the 追火 eligibility can read fire #1's bucket.
+    state2["positions"][key] = {
+        "key": key, "settled": False, "direction": "high",
+        "legs": [leg("buy_yes_new", "h35", 10), leg("buy_no_broken", "h34", 5)],
+    }
+    t2 = datetime(2026, 9, 10, 7, 40, tzinfo=timezone.utc)
+    a2 = run_stage(state2, tracker, 36.4, t2, "h35", 0.55)
+    fire2 = next((a for a in a2 if a.get("action_type") == "re_fire"), None)
+    f2legs = sorted({str(l.get("leg")) for l in (fire2.get("legs") or [])}) if fire2 else []
+    c2 = (fire2 is not None and fire2.get("fire_no") == 2 and fire2.get("refire") is True
+          and f2legs == ["buy_no_broken", "buy_yes_new"]
+          and ensure_re_state(state2)["fired"][key].get("fires") == 2)
+    # third break after another restart: fires==2 -> already_fired
+    state3 = deepcopy(state2)
+    t3 = datetime(2026, 9, 10, 9, 0, tzinfo=timezone.utc)
+    a3 = run_stage(state3, tracker, 37.3, t3, "h36", 0.55)
+    c3 = not any(a.get("action_type") == "re_fire" for a in a3) and any(a.get("reason") == "already_fired" for a in a3)
+    # --- legacy record (no fires field) treated as 1 fire used: one 追火 ---
+    stateL = {"paper_initial_capital_usdc": 100.0, "paper_total_debit_usdc": 0.0,
+              "entry_count": 0, "positions": {}, "weatherbotyes2re": {}}
+    ensure_re_state(stateL)
+    ensure_re_state(stateL)["ever_armed"][key] = iso_utc(t1)
+    ensure_re_state(stateL)["fired"][key] = {"status": "fired", "at_utc": iso_utc(t1),
+                                              "jump": 1, "ref_source": "market_rank1"}
+    stateL["positions"][key] = {"key": key, "settled": False, "direction": "high",
+                                "legs": [leg("buy_yes_new", "h35", 10)]}
+    trackerL = ConsensusTracker(min_samples=3)
+    aL = run_stage(stateL, trackerL, 36.4, t2, "h35", 0.55)
+    fireL = next((a for a in aL if a.get("action_type") == "re_fire"), None)
+    fLlegs = sorted({str(l.get("leg")) for l in (fireL.get("legs") or [])}) if fireL else []
+    c4 = (fireL is not None and fireL.get("fire_no") == 2
+          and fLlegs == ["buy_no_broken", "buy_yes_new"]
+          and ensure_re_state(stateL)["fired"][key].get("fires") == 2)
+    return {"name": "refire_persists_across_restart",
+            "ok": all([c1, c2, c3, c4]), "checks": {"c1": c1, "c2": c2, "c3": c3, "c4": c4},
+            "types2": [a.get("action_type") for a in a2],
+            "types3": [a.get("action_type") for a in a3],
+            "reasons3": [a.get("reason") for a in a3],
+            "typesL": [a.get("action_type") for a in aL]}
+
+
+if __name__ == "__main__":
     main()

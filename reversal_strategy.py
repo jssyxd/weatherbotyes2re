@@ -11,6 +11,17 @@ Fire only when:
   3) local hour in fire window (HIGH 12..18 local, LOW 0..9)
   4) broken bucket was long-horizon market consensus (1-2h TWAP rank-1)
 
+A session may fire AT MOST TWICE (2026-09-09 operator decision, warsaw
+2026-09-09 low 17->16->15 double break): the first breach, then ONE "追火"
+when a fresh obs breaks ONE bucket further AFTER the reference (TAF AMD or
+consensus rank-1) has ratcheted onto the bucket fire #1 bought YES in. The
+追火腿 is STRUCTURALLY SYMMETRIC with fire #1 (2026-09-09 operator reversal):
+buy_no_broken on the newly-broken bucket (the bucket fire #1 holds YES in —
+its NO is ~1 but still tried, capped/sized exactly like fire #1's NO leg)
+PLUS buy_yes_new on the new bucket. On the second fire the cycle additionally
+sells fire #1's old-bucket YES leg at best_bid (``_r_cycle.record_refire``);
+breaks past fire #2 take no further action.
+
 NO leg on broken bucket is the main trade; YES on new bucket is optional and smaller.
 """
 from __future__ import annotations
@@ -26,6 +37,7 @@ from _r_state import _SECTIONS as STATE_SECTIONS
 
 ARM_C = 1.0
 MAX_BUCKET_JUMP = 1
+MAX_FIRES_PER_SESSION = 2  # one fire + one 追火 (2026-09-09 double-break rule)
 NO_MAX_ASK = Decimal("0.85")
 YES_MAX_ASK = Decimal("0.48")
 NO_NOTIONAL_PCT = Decimal("0.75")
@@ -137,6 +149,72 @@ def bucket_index(ordered: list[dict[str, Any]], bucket: dict[str, Any] | None) -
 
 def session_key(city_id: str, market_local_date: str, direction: str) -> str:
     return f"{city_id}|{market_local_date}|{direction}"
+
+
+def fires_used(rec: dict[str, Any] | None) -> int:
+    """Real fires a session has already used, read from its ``fired`` record.
+
+    A record without the ``fires`` counter is either pre-2026-09-09 state or a
+    one-shot skip lock. Migration decision: treat it as ONE fire used so an
+    old fired key may still 追火 once (a lock-only key has no open YES leg, so
+    the re-fire eligibility below keeps it inert in practice).
+    """
+    if not rec:
+        return 0
+    if "fires" in rec:
+        try:
+            return max(0, int(rec["fires"] or 0))
+        except (TypeError, ValueError):
+            return 1
+    return 1
+
+
+def refire_target_index(
+    state: dict[str, Any],
+    key: str,
+    direction: str,
+    ordered: list[dict[str, Any]],
+    run_b: dict[str, Any] | None,
+) -> int | None:
+    """Index (in ``ordered``) of fire #1's YES bucket when the current running
+    extreme sits strictly beyond it in the direction of travel — else None.
+
+    The session's open paper position (the ledger is the source of truth for
+    what a fire actually bought) is where fire #1's YES leg is read. None
+    means: no open position, no un-settled YES leg with shares, an unknown
+    bucket, or an obs that did not LEAVE that bucket — a same-bucket drift
+    must stay ``already_fired`` (see no_double_fire), never re-fire.
+    """
+    i_run = bucket_index(ordered, run_b)
+    if i_run is None:
+        return None
+    pos = (state.get("positions") or {}).get(key)
+    if pos is None or pos.get("settled"):
+        return None
+    for lg in pos.get("legs") or []:
+        if lg.get("settled"):
+            continue
+        if str(lg.get("outcome") or "").upper() != "YES":
+            continue
+        try:
+            if Decimal(str(lg.get("shares") or 0)) <= ZERO:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        b1 = lg.get("bucket_id")
+        if not b1:
+            return None
+        i1 = None
+        for i, b in enumerate(ordered):
+            if str(b.get("bucket_id") or b.get("id") or "") == str(b1):
+                i1 = i
+                break
+        if i1 is None:
+            return None
+        if (direction == "high" and i_run > i1) or (direction == "low" and i_run < i1):
+            return i1
+        return None
+    return None
 
 
 def prune_stale_sessions(state: dict[str, Any], cities: list[dict[str, Any]], now_utc: datetime | None = None) -> int:
@@ -362,8 +440,14 @@ def maybe_arm_or_fire(
         now_utc,
     )
 
-    if key in tree["fired"]:
-        return [{"action_type": "re_skip", "reason": "already_fired", "key": key}]
+    fired_rec = tree["fired"].get(key)
+    fires_before = fires_used(fired_rec)
+    # MAX_FIRES_PER_SESSION (2): one fire + one 追火. A session that already
+    # used both is done for the day — any further break settles in the held
+    # legs, no more action.
+    if fires_before >= MAX_FIRES_PER_SESSION:
+        return [{"action_type": "re_skip", "reason": "already_fired", "key": key,
+                 "fires": fires_before, "max": MAX_FIRES_PER_SESSION}]
 
     # Bug 1 + Bug 3 — TRIPLE LOCK: in addition to the fired marker, refrain
     # from re-firing when an open (unsettled) paper position already exists
@@ -371,10 +455,13 @@ def maybe_arm_or_fire(
     # "a fire actually produced work" — without this guard a prune-then-fire
     # pattern (or a crash-mid-cycle on the live deploy) re-opens the same
     # 22-fire-on-Seoul gate seen 2026-09-05 even though tree["fired"][key]
-    # remained set in memory.
+    # remained set in memory. 2026-09-09: this lock applies ONLY when the
+    # fired marker is absent — with a fires==1 marker an open position is the
+    # NORMAL pre-追火 state (fire #1's position stays open until settlement)
+    # and the eligibility gate below decides whether a second fire may run.
     _positions = state.get("positions") or {}
     _existing = _positions.get(key)
-    if _existing is not None and not _existing.get("settled"):
+    if fired_rec is None and _existing is not None and not _existing.get("settled"):
         tree["fired"][key] = {
             "status": "fired_no_fill", "at_utc": iso_utc(now_utc),
             "jump": None, "ref_source": "lock_open_position",
@@ -444,6 +531,19 @@ def maybe_arm_or_fire(
 
     distance_c = abs(running - float(ref_extreme))
     jump = run_i - taf_i if direction == "high" else taf_i - run_i
+
+    # Re-fire lane (one fire already used): the only event that may consume
+    # fire #2 is a NEW fresh obs whose running extreme broke ONE bucket past
+    # the YES bucket fire #1 actually bought (the reference having ratcheted
+    # there — warsaw 16 after the 17->16 break). Same-bucket drift and any
+    # non-breaking obs stay already_fired and never re-arm the session.
+    refiring = False
+    if fires_before == 1:
+        if jump <= 0 or refire_target_index(state, key, direction, ordered, run_b) is None:
+            return [{"action_type": "re_skip", "reason": "already_fired", "key": key,
+                     "fires": 1, "max": MAX_FIRES_PER_SESSION,
+                     "detail": "no_further_break"}]
+        refiring = True
 
     armed = tree["armed"].get(key)
     if jump <= 0 and distance_c <= arm_c and hour_ok(direction, local_hour, high_start, high_hour_end, low_start, low_end):
@@ -532,11 +632,15 @@ def maybe_arm_or_fire(
     # skip the whole basket, not "fire YES only" — the YES-primary
     # oversize-TAF branch has done us no favours in production.
     if jump != 1:
-        tree["fired"][key] = {
-            "status": "fired_no_fill", "at_utc": iso_utc(now_utc),
-            "jump": jump, "ref_source": ref_source,
-            "reason": "jump_must_be_one",
-        }
+        # A one-shot skip lock (marker written only when none exists — a real
+        # fires==1 record from fire #1 must never be clobbered; a 2-bucket
+        # crash inside the re-fire lane leaves the 追火 slot available).
+        if key not in tree["fired"]:
+            tree["fired"][key] = {
+                "status": "fired_no_fill", "at_utc": iso_utc(now_utc),
+                "jump": jump, "ref_source": ref_source,
+                "reason": "jump_must_be_one",
+            }
         tree["armed"].pop(key, None)
         return [{"action_type": "re_skip", "reason": "jump_must_be_one",
                  "key": key, "jump": jump, "ref_source": ref_source}]
@@ -552,11 +656,12 @@ def maybe_arm_or_fire(
     # consensus.
     ever = tree.get("ever_armed", {}).get(key)
     if armed is None and not ever:
-        tree["fired"][key] = {
-            "status": "fired_no_fill", "at_utc": iso_utc(now_utc),
-            "jump": jump, "ref_source": ref_source,
-            "reason": "break_without_arm",
-        }
+        if key not in tree["fired"]:
+            tree["fired"][key] = {
+                "status": "fired_no_fill", "at_utc": iso_utc(now_utc),
+                "jump": jump, "ref_source": ref_source,
+                "reason": "break_without_arm",
+            }
         tree["armed"].pop(key, None)
         return [{"action_type": "re_skip", "reason": "break_without_arm",
                  "key": key, "jump": jump,
@@ -607,14 +712,20 @@ def maybe_arm_or_fire(
     #     when the reference is market-derived; anything larger is noise and
     #     is skipped outright (no NO-only fire either).
     max_consensus_jump = int(cfg.get("max_consensus_jump", MAX_BUCKET_JUMP))
+    # Note: a 追火 (refiring==True) flows through the same branches below —
+    # jump is guaranteed 1 by the lane gate, so it lands in the standard
+    # ``else`` and builds the SAME leg pair as fire #1 (buy_no_broken on the
+    # newly-broken bucket + buy_yes_new), exactly the symmetric structure the
+    # operator wants (2026-09-09 reversal of the YES-only refire design).
     if jump > max_jump:
         if ref_source != "taf":
             # market-consensus reference with an oversized jump → not an edge.
             # Mark fired so the session doesn't re-arm and re-alert every tick.
-            tree["fired"][key] = {
-                "status": "fired_no_fill", "at_utc": iso_utc(now_utc), "jump": jump,
-                "ref_source": ref_source, "reason": "jump_too_large_for_ref",
-            }
+            if key not in tree["fired"]:
+                tree["fired"][key] = {
+                    "status": "fired_no_fill", "at_utc": iso_utc(now_utc), "jump": jump,
+                    "ref_source": ref_source, "reason": "jump_too_large_for_ref",
+                }
             tree["armed"].pop(key, None)
             return [{"action_type": "re_skip", "reason": "jump_too_large_for_ref", "key": key,
                      "jump": jump, "ref_source": ref_source}]
@@ -633,10 +744,11 @@ def maybe_arm_or_fire(
         # same guard for the (jump <= max_jump but still > market-only cap)
         # case — unreachable while max_consensus_jump == max_jump, kept for
         # configurability if the TAF cap is later widened.
-        tree["fired"][key] = {
-            "status": "fired_no_fill", "at_utc": iso_utc(now_utc), "jump": jump,
-            "ref_source": ref_source, "reason": "jump_too_large_for_ref",
-        }
+        if key not in tree["fired"]:
+            tree["fired"][key] = {
+                "status": "fired_no_fill", "at_utc": iso_utc(now_utc), "jump": jump,
+                "ref_source": ref_source, "reason": "jump_too_large_for_ref",
+            }
         tree["armed"].pop(key, None)
         return [{"action_type": "re_skip", "reason": "jump_too_large_for_ref", "key": key,
                  "jump": jump, "ref_source": ref_source}]
@@ -705,13 +817,19 @@ def maybe_arm_or_fire(
     # Bug 3 — third lock, write side: stamp the exact obs_time this fire
     # was dispatched on. Future cycles on the same key use this to reject
     # duplicate pushes before the is_new_obs_time check runs.
+    new_fires = min(MAX_FIRES_PER_SESSION, fires_before + 1)
     tree["fired"][key] = {
         "status": "fired",
         "at_utc": iso_utc(now_utc),
         "jump": jump,
         "ref_source": ref_source,
         "consensus_rank": consensus_meta.get("rank"),
+        "fires": new_fires,
+        "new_bucket_id": fire["new_bucket_id"],
     }
+    fire["fire_no"] = new_fires
+    if refiring:
+        fire["refire"] = True
     tree["armed"].pop(key, None)
     if obs_time_utc is not None:
         tree.setdefault("last_fire_obs", {})[key] = iso_utc(obs_time_utc)

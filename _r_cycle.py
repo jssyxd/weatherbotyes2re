@@ -35,7 +35,7 @@ from _r_exec import settle_markets
 from _r_globals import book_cache, bump, clob, set_health_extra, stamp, tracker
 from _r_state import DEFAULTS, log_event
 from adapters.polymarket.orderbook import from_any
-from paper_capital import release, reserve
+from paper_capital import close_leg_at_best_bid, reserve
 from research import common
 from reversal_strategy import ensure_re_state, maybe_arm_or_fire, prune_stale_sessions
 from ws_bridge import ws_bridge
@@ -46,6 +46,9 @@ _SLEEVE_RING = sleeve_signal.PriceRing(window_s=900.0)
 
 LOG_FIELDS = None
 ZERO = Decimal("0")
+# A cached book older than this is refreshed once before the 追火 old-YES
+# liquidation reads best_bid (a stale/missing book must not read as "no bid").
+_CLOSE_BOOK_STALE_S = 10.0
 
 # Which side token we sample for consensus.
 # Last-good METAR map, carried so telemetry (and the watcher reading health)
@@ -762,26 +765,17 @@ def _expire_stale_sleeves(cfg: dict[str, Any], state: dict[str, Any], now_utc: d
         if leg is None:
             rec["status"] = "expired_no_leg"
             continue
-        tok = str(leg.get("token_id") or "")
-        book = cache.get(tok) if tok else None
-        bid = None
-        if book:
-            bid = book.get("best_bid")
-        shares = Decimal(str(leg.get("shares") or 0))
-        proceeds = ZERO
-        if bid is not None and shares > ZERO:
-            try:
-                proceeds = (Decimal(str(bid)) * shares).quantize(Decimal("0.0001"))
-            except Exception:  # noqa: BLE001
-                proceeds = ZERO
-        if proceeds > ZERO:
-            release(state, proceeds)
-        # Mark leg settled (loss = cost minus proceeds; cost already debited).
-        leg["settled"] = True
-        leg["leg_won"] = False
-        leg["closed_by"] = "sleeve_timeout"
-        leg["sleeve_close_proceeds_usdc"] = str(proceeds)
-        leg["settled_at_utc"] = re_execution.iso_utc(now_utc)
+        # Shared paper close (best_bid sell / write-off at 0 when no bid) —
+        # the same helper the 追火 old-leg liquidation uses (2026-09-09).
+        close = close_leg_at_best_bid(
+            state, leg, books=cache, closed_by="sleeve_timeout",
+            settled_at_utc=re_execution.iso_utc(now_utc),
+        )
+        if close is None:
+            rec["status"] = "expired_no_leg"
+            continue
+        proceeds = Decimal(str(close["proceeds_usdc"]))
+        bid = close.get("bid")
         if all(lg.get("settled") for lg in pos.get("legs", [])):
             pos["settled"] = True
             pos["settled_at_utc"] = re_execution.iso_utc(now_utc)
@@ -796,7 +790,7 @@ def _expire_stale_sleeves(cfg: dict[str, Any], state: dict[str, Any], now_utc: d
                 "session_key": sess_key,
                 "position_key": pos_key,
                 "age_s": round(age_s, 1),
-                "shares": str(shares),
+                "shares": close.get("shares"),
                 "proceeds_usdc": str(proceeds),
                 "bid_at_close": str(bid) if bid is not None else None,
                 "ts_utc": now_utc.isoformat(),
@@ -978,6 +972,7 @@ def _record_fire_event(cfg, state, fire, position, ladlog, now_utc) -> None:
         {
             "type": "fire",
             "key": fire.get("key"),
+            "fire_no": int(fire.get("fire_no") or 1),
             "city_id": fire.get("city_id"),
             "icao": fire.get("icao"),
             "direction": fire.get("direction"),
@@ -992,6 +987,172 @@ def _record_fire_event(cfg, state, fire, position, ladlog, now_utc) -> None:
                 {k: v for k, v in intent.items() if k != "fill"} | ({"fill": intent.get("fill")} if intent.get("fill") else {})
                 for intent in ladlog
             ],
+        },
+    )
+
+
+def record_refire(
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    fire: dict[str, Any],
+    position: dict[str, Any],
+    ladlog: list[dict[str, Any]],
+    now_utc: datetime,
+) -> None:
+    """Second-fire (追火) ledger write for a session that already fired once.
+
+    The 追火腿 is structurally symmetric with fire #1 (buy_no_broken on the
+    newly-broken bucket + buy_yes_new), so ``position`` may carry both legs
+    under the same names as fire #1's row; both are merged as filled legs.
+    Fire #1's position is still open under the session key. Once the refire's
+    new-bucket YES leg actually filled:
+      1. sell fire #1's OLD-bucket YES leg at best_bid — proceeds released
+         back to the pool; a missing/no-bid book writes the leg off at 0
+         (shared ``close_leg_at_best_bid``; the refire's NO leg on that very
+         bucket is its book-side offset, a no-fill there is acceptable).
+      2. append the refire's filled legs to the SAME position record so a
+         session keeps one ledger row (prune / settlement / reports
+         invariants — one position per session key) with an auditable
+         ``refire_*`` stamp on it.
+    A refire that fills nothing consumes its fire slot (fired.fires == 2) but
+    never liquidates the old leg — no new YES secured, the old leg rides to
+    settlement.
+    """
+    ensure_re_state(state)
+    sess = fire.get("key")
+    positions = state.setdefault("positions", {})
+    old = positions.get(sess)
+    new_legs = [
+        lg for lg in (position.get("legs") or [])
+        if Decimal(str(lg.get("shares") or 0)) > ZERO
+    ]
+    if not new_legs:
+        # Refire filled nothing (below floor / above cap / empty book): the
+        # fire slot is consumed (fired.fires == 2, no retry) but the ledger is
+        # untouched — fire #1's old YES leg rides to settlement.
+        state["entry_count"] = int(state.get("entry_count") or 0) + 1
+        log_event(
+            cfg.get("log_path"),
+            {
+                "type": "fire",
+                "key": sess,
+                "fire_no": int(fire.get("fire_no") or 2),
+                "city_id": fire.get("city_id"),
+                "icao": fire.get("icao"),
+                "direction": fire.get("direction"),
+                "jump": fire.get("jump"),
+                "ref_source": fire.get("ref_source"),
+                "refire": True,
+                "refire_unfilled": True,
+                "fills": {},
+                "ladder": [
+                    {k: v for k, v in intent.items() if k != "fill"} | ({"fill": intent.get("fill")} if intent.get("fill") else {})
+                    for intent in ladlog
+                ],
+                "ts_utc": now_utc.isoformat(),
+            },
+        )
+        return
+    # The 追火腿 carries the SAME leg names as fire #1 (buy_no_broken +
+    # buy_yes_new, symmetric by operator decision 2026-09-09) — detect the
+    # filled refire YES leg by outcome, not by name.
+    filled_refire_yes = any(
+        str(lg.get("outcome") or "").upper() == "YES" for lg in new_legs
+    )
+    close: dict[str, Any] | None = None
+    if old is not None and not old.get("settled") and filled_refire_yes:
+        old_yes = next(
+            (
+                lg for lg in (old.get("legs") or [])
+                if not lg.get("settled")
+                and str(lg.get("outcome") or "").upper() == "YES"
+                and Decimal(str(lg.get("shares") or 0)) > ZERO
+            ),
+            None,
+        )
+        if old_yes is not None:
+            # Freshness guard on the old YES leg's book (audit follow-up): a
+            # transient fetch gap must not be read as "no bid" and silently
+            # write the leg off at 0. Mirror _paper_fire's missing-token
+            # refresh — when the token is not cached or its cached ladder is
+            # stale (> _CLOSE_BOOK_STALE_S), pull it once, then close off the
+            # refreshed book. Still no book after the attempt -> write off at
+            # 0 with book_unavailable=True in the close_old_yes event.
+            old_tok = str(old_yes.get("token_id") or "")
+            close_books = book_cache()
+            book = close_books.get(old_tok) if old_tok else None
+            book_unavailable = False
+            fetched = (book or {}).get("fetched_at_epoch")
+            stale = not old_tok or book is None or (fetched is not None
+                                                    and time.time() - float(fetched) > _CLOSE_BOOK_STALE_S)
+            if stale and old_tok:
+                try:
+                    refresh_books(cfg, [old_tok], now_utc)
+                except Exception:  # noqa: BLE001 — refresh best-effort; fall through to 0
+                    pass
+                close_books = book_cache()
+                book = close_books.get(old_tok) if old_tok else None
+            book_unavailable = not old_tok or book is None
+            close = close_leg_at_best_bid(
+                state, old_yes, books=close_books, closed_by="refire_liquidation",
+                settled_at_utc=re_execution.iso_utc(now_utc),
+            )
+            if close is not None:
+                try:
+                    cost = Decimal(str(old_yes.get("cost_usdc") or 0))
+                except Exception:  # noqa: BLE001
+                    cost = ZERO
+                loss = max(ZERO, cost - Decimal(str(close["proceeds_usdc"])))
+                log_event(cfg.get("log_path"), {
+                    "type": "close_old_yes",
+                    "key": sess,
+                    "fire_no": int(fire.get("fire_no") or 2),
+                    "leg": old_yes.get("leg"),
+                    "token_id": old_yes.get("token_id"),
+                    "bucket_id": old_yes.get("bucket_id"),
+                    "shares": close.get("shares"),
+                    "bid_at_close": close.get("bid"),
+                    "proceeds_usdc": close.get("proceeds_usdc"),
+                    "loss_usdc": str(loss),
+                    "closed_by": "refire_liquidation",
+                    "book_unavailable": book_unavailable,
+                    "ts_utc": now_utc.isoformat(),
+                })
+    if old is not None:
+        # Merge the refire's filled legs into the session's single position.
+        for lg in new_legs:
+            old.setdefault("legs", []).append(lg)
+        old["refire_at_utc"] = re_execution.iso_utc(now_utc)
+        old["refire_jump"] = fire.get("jump")
+        old["refire_ref_source"] = fire.get("ref_source")
+        old["refire_running_extreme"] = fire.get("running_extreme")
+        position = old
+    else:
+        # No first position (anomaly): fall back to a standalone record.
+        positions[sess] = position
+    state["entry_count"] = int(state.get("entry_count") or 0) + 1
+    log_event(
+        cfg.get("log_path"),
+        {
+            "type": "fire",
+            "key": sess,
+            "fire_no": int(fire.get("fire_no") or 2),
+            "city_id": fire.get("city_id"),
+            "icao": fire.get("icao"),
+            "direction": fire.get("direction"),
+            "jump": fire.get("jump"),
+            "ref_source": fire.get("ref_source"),
+            "refire": True,
+            "close_old_yes": close,
+            "fills": {
+                str(lg.get("leg")): {"shares": lg.get("shares"), "cost": lg.get("cost_usdc"), "avg": lg.get("avg_price")}
+                for lg in new_legs
+            },
+            "ladder": [
+                {k: v for k, v in intent.items() if k != "fill"} | ({"fill": intent.get("fill")} if intent.get("fill") else {})
+                for intent in ladlog
+            ],
+            "ts_utc": now_utc.isoformat(),
         },
     )
 
@@ -1308,16 +1469,27 @@ def run_cycle(
                 armed_any = True
                 log_event(log_path, {"type": "arm", "key": action.get("key"), **{k: action[k] for k in ("ref_source", "distance_c") if k in action}})
             elif atype in ("re_fire",):
-                log_event(log_path, {"type": "fire_attempt", "key": action.get("key"), "jump": action.get("jump"), "ref_source": action.get("ref_source")})
+                fire_no = int(action.get("fire_no") or 1)
+                log_event(log_path, {"type": "fire_attempt", "key": action.get("key"),
+                                     "fire_no": fire_no, "jump": action.get("jump"),
+                                     "ref_source": action.get("ref_source")})
                 position, ladlog = _paper_fire(cfg, state, action, now)
                 if position is not None:
-                    _record_fire_event(cfg, state, action, position, ladlog, now)
+                    if fire_no >= 2:
+                        # 追火: liquidate fire #1's old YES leg (on fill) and
+                        # merge the new legs into the session position.
+                        record_refire(cfg, state, action, position, ladlog, now)
+                    else:
+                        _record_fire_event(cfg, state, action, position, ladlog, now)
                 else:
                     # insufficient capital / nothing fillable — mark fired anyway
-                    # so we don't retry-fire the same session each tick.
-                    tree.setdefault("fired", {})[action["key"]] = {
-                        "status": "fired_no_fill", "at_utc": re_execution.iso_utc(now), "jump": action.get("jump"),
-                    }
+                    # so we don't retry-fire the same session each tick. Update
+                    # the strategy-written record IN PLACE so its fires counter
+                    # (the fire-slot credential) survives the no-fill status.
+                    rec = tree.setdefault("fired", {}).setdefault(action["key"], {})
+                    rec["status"] = "fired_no_fill"
+                    rec["at_utc"] = re_execution.iso_utc(now)
+                    rec["jump"] = action.get("jump")
                 # fire branch complete — never fall through to skip logging
                 continue
             elif atype in ("re_skip", "re_skip_yes"):
