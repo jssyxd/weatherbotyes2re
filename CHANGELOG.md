@@ -1,5 +1,14 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-10 — LIVE 执行层 Phase 2: 干跑签名（绝不提交）(`live/order_plan.py`, `live/sign_dryrun.py`)
+
+- `live/order_plan.py` — 纯函数（stdlib）：腿意图 + 盘口 + 预算 + 价格上限 ⇒ 可签名订单参数。tick 向下对齐、股数取整、`below_min_order_size` / `price_above_cap` / `insufficient_budget` / `no_book` / 非法输入（负价、NaN、None、超大值）一律 **fail-closed**；价格上限**只读**取自 `config/yes2re_reversal.json`，缺键即 `CapsError`（不得默认放行成无上限）。
+- `live/sign_dryrun.py` — 干跑器：先用**运行时哨兵**把 client 全部写入面替换为抛 `RuntimeError` 的函数（order / cancel / RFQ / credential-admin / state-write，共 **21** 个方法，含 `post_heartbeat`=POST `/v1/heartbeats`、`drop_notifications`=DELETE `/notifications`），再用 py-clob-client `create_order()` 仅做 **EIP-712 本地签名**；必须显式 `--confirm-dryrun`；产物 `data/live_order_dryrun.json`（含哨兵证明，不含任何密钥）。
+- **取证**：socket 级出网 trace 证明真实网络干跑下**零非 GET 请求**；21 个哨兵逐个实测拦截；审计方独立枚举 `dir(ClobClient)` 写方法集合做覆盖率对比。
+- **独立审计**（herdr impl+audit，对抗性）：首轮 NEEDS_FIX → 修复 F3（超大有限预算触发 `decimal.InvalidOperation` 抛出）/ F4（哨兵遗漏两个真实写端点）/ F5（缺 cap 键静默返回 1.0 = 无上限）→ **Delta 复审 APPROVE**。
+- `tests_live.py` 扩至 **24** 项全绿（含哨兵承重性与覆盖面断言、变异验证）。
+
+
 ## 2026-09-10 — LIVE 执行层 Phase 1: 只读对账层 (`live/`)
 
 - **新增完全独立的只读 live 侧模块**（主引擎仍硬性 paper-only；未改动任何现有模块、config 值或服务）：
