@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""stdlib-only tests for the live layer — Phase 1 (read-only) + Phase 2 (dry-run).
+"""stdlib-only tests for the live layer — Phase 1 (read-only) + Phase 2 (dry-run)
++ Phase 3 (gated submit channel). No network, no py-clob-client, no real order.
 
 Run:  python3.13 tests_live.py    → prints PASS/FAIL per check, exit = #failures.
 """
@@ -9,13 +10,21 @@ import ast
 import contextlib
 import io
 import json
+import sys
 import tempfile
+import types
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from live import clob_client, creds, order_plan, reconcile, risk_gate, sign_dryrun
+from live import clob_client, creds, order_plan, reconcile, risk_gate, sign_dryrun, smoke, submit
 
 ROOT = Path(__file__).resolve().parent
+
+# Module-scope safeguard: any submit/cancel the suite makes that forgets to patch AUDIT_PATH
+# lands in a throwaway file, never in the real data/live_events.jsonl (audit integrity).
+TMP_AUDIT_DIR = tempfile.mkdtemp(prefix="live-tests-audit-")
+submit.AUDIT_PATH = Path(TMP_AUDIT_DIR) / "live_events.jsonl"
 
 PRIVATE_KEY = "0x" + "ab" * 32
 FUNDER = "0x" + "cd" * 20
@@ -347,21 +356,37 @@ FORBIDDEN_CALLS = (
     "create_api_key", "derive_api_key", "delete_api_key", "update_balance_allowance",
     "post_heartbeat", "delete_readonly_api_key", "submit",
 )
-#: Phase 2 may sign — and only sign — through this call
+#: signing entry point (local only) — allowed in the phase-2 dry run and the submit channel
 SIGN_ONLY_CALLS = ("create_order",)
+#: the single controlled write channel
+SUBMIT_MODULE = "submit.py"
+#: write calls allowed inside SUBMIT_MODULE only
+CONTROLLED_WRITE_CALLS = ("create_order", "post_order", "cancel")
+#: names that may appear in SUBMIT_MODULE only as their single call site
+CHANNEL_ONLY = ("post_order", "cancel")
+#: module-name style uses we do not police (``submit.audit(...)`` in the orchestrator)
+NAME_USAGE_SKIP = {"submit"}
 
 
 def test_static_no_order_path():
-    """Hard read-only guarantee, AST-based.
+    """Write-path confinement, AST-based (Phase 1/2 rule, tightened for Phase 3).
 
-    Phase 2 legitimately mentions ``post_order`` and friends as string literals and as
-    ``setattr(client, name, sentinel)`` *replacements* — data, never a call. So the
-    assertion is on the AST: no call may use a forbidden name, forbidden names may not
-    appear as real attribute accesses (``client.post_order``), and no module may invoke
-    a computed function (``f()()``), which would be a hidable write path.
+    Phase 1/2 forbade write calls outright. Phase 3 introduces exactly one controlled
+    channel, so the invariant becomes:
+
+    * every write-class call lives in ``live/submit.py`` and nowhere else;
+    * there is exactly **one** ``post_order`` call site in the whole package (one auditable
+      chokepoint) and exactly one ``cancel``;
+    * forbidden names appear in ``submit.py`` only as those call sites — never as a
+      free-standing attribute/name that could be handed to something else;
+    * phase-2 names (``post_orders``/``cancel_all``/RFQ/credential-admin/state-write) remain
+      *data only*: string literals and ``setattr`` targets, never calls;
+    * no module may call a computed function (``f()()``) — a hidable write path.
     """
     files = sorted((ROOT / "live").glob("*.py"))
     assert files, "no live/ modules found"
+    calls = {name: [] for name in CONTROLLED_WRITE_CALLS}
+    uses = {name: [] for name in FORBIDDEN_CALLS if name not in NAME_USAGE_SKIP}
     for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
@@ -376,20 +401,45 @@ def test_static_no_order_path():
                         f"{path.name}:{node.lineno} calls a computed function (f()()) — hidable write path"
                     )
                     name = None
-                assert name not in FORBIDDEN_CALLS, f"{path.name}:{node.lineno} calls {name}()"
-            if isinstance(node, ast.Attribute):
-                assert node.attr not in FORBIDDEN_CALLS, (
-                    f"{path.name}:{node.lineno} accesses .{node.attr} as code "
-                    "(allowed only as a string literal / setattr target)"
-                )
+                if name in FORBIDDEN_CALLS:
+                    assert path.name == SUBMIT_MODULE, (
+                        f"{path.name}:{node.lineno} calls {name}() — only live/{SUBMIT_MODULE} may write"
+                    )
+                if name in calls:
+                    calls[name].append(f"{path.name}:{node.lineno}")
+            if isinstance(node, ast.Attribute) and node.attr in uses:
+                uses[node.attr].append(f"{path.name}:{node.lineno}")
+            if isinstance(node, ast.Name) and node.id in uses:
+                uses[node.id].append(f"{path.name}:{node.lineno}")
+
+    # exactly one post_order / cancel / create_order call site, all inside the channel module
+    assert len(calls["post_order"]) == 1, calls["post_order"]
+    assert calls["post_order"][0].startswith(SUBMIT_MODULE + ":"), calls["post_order"]
+    assert len(calls["cancel"]) == 1, calls["cancel"]
+    assert calls["cancel"][0].startswith(SUBMIT_MODULE + ":"), calls["cancel"]
+    assert {site.split(":")[0] for site in calls["create_order"]} == {SUBMIT_MODULE, "sign_dryrun.py"}, \
+        calls["create_order"]
+    # the channel's write calls may only appear as those call sites (never as values)
+    for name in CHANNEL_ONLY:
+        assert len(uses.get(name, [])) == len(calls[name]) == 1, (name, uses.get(name), calls[name])
+        assert uses[name][0].startswith(SUBMIT_MODULE + ":"), uses[name]
+    # every other forbidden name stays data-only (string literal / setattr target)
+    for name in FORBIDDEN_CALLS:
+        if name in CHANNEL_ONLY or name in NAME_USAGE_SKIP:
+            continue
+        assert not uses.get(name), f"{name} must stay data-only, found code use at {uses[name]}"
+
+    # the smoke orchestrator must reach the write path only through the channel module
+    smoke_text = (ROOT / "live" / "smoke.py").read_text(encoding="utf-8")
+    assert "submit.submit_order" in smoke_text and "submit.cancel_order" in smoke_text, \
+        "smoke must submit/cancel through live/submit.py"
     signers = {
         path.name for path in files
         if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                and node.func.attr in SIGN_ONLY_CALLS
                for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
     }
-    assert signers == {"sign_dryrun.py"}, f"unexpected signing modules: {signers}"
-
+    assert signers == {"sign_dryrun.py", SUBMIT_MODULE}, f"unexpected signing modules: {signers}"
 
 
 # --------------------------------------------------------------------------- Phase 2: order_plan
@@ -799,6 +849,717 @@ def test_dryrun_fail_closed():
     assert report["submit"]["attempted"] is False
 
 
+# --------------------------------------------------------------------------- Phase 3: gates
+
+def _flow_env(**overrides):
+    env = {**VALID_ENV, "LIVE_SUBMIT_ENABLED": "1", "LIVE_FIRE_BUDGET_USDC": "5",
+           "LIVE_MAX_OPEN_POSITIONS": "22", "LIVE_MAX_CAPITAL_USDC": "500"}
+    env.update(overrides)
+    return env
+
+
+@contextlib.contextmanager
+def _audit_path(path):
+    saved = submit.AUDIT_PATH
+    submit.AUDIT_PATH = Path(path)
+    try:
+        yield Path(path)
+    finally:
+        submit.AUDIT_PATH = saved
+
+
+def _audit_lines(path):
+    text = Path(path).read_text(encoding="utf-8") if Path(path).exists() else ""
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def test_submit_gate_matrix():
+    today = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+    assert submit.phrase(today) == "SMOKE-2026-09-10", submit.phrase(today)
+    assert submit.phrase(today).startswith("SMOKE-")
+    good_env = {"LIVE_SUBMIT_ENABLED": "1"}
+    ok = submit.gate_status(enable_submit=True, env=good_env, confirm="SMOKE-2026-09-10", now=today)
+    assert ok["ok"] and ok["reason"] == submit.GATE_OK, ok
+    matrix = [
+        (dict(enable_submit=False, env=good_env, confirm="SMOKE-2026-09-10"), submit.GATE_FLAG),
+        (dict(enable_submit=True, env={}, confirm="SMOKE-2026-09-10"), submit.GATE_ENV),
+        (dict(enable_submit=True, env={"LIVE_SUBMIT_ENABLED": "0"}, confirm="SMOKE-2026-09-10"), submit.GATE_ENV),
+        (dict(enable_submit=True, env={"LIVE_SUBMIT_ENABLED": "true"}, confirm="SMOKE-2026-09-10"), submit.GATE_ENV),
+        (dict(enable_submit=True, env=good_env, confirm=None), submit.GATE_CONFIRM_MISSING),
+        (dict(enable_submit=True, env=good_env, confirm="  "), submit.GATE_CONFIRM_MISSING),
+        (dict(enable_submit=True, env=good_env, confirm="SMOKE-2026-09-09"), submit.GATE_CONFIRM_MISMATCH),
+        (dict(enable_submit=True, env=good_env, confirm="letmein"), submit.GATE_CONFIRM_MISMATCH),
+    ]
+    for kwargs, reason in matrix:
+        got = submit.gate_status(now=today, **kwargs)
+        assert got["ok"] is False and got["reason"] == reason, (kwargs, got)
+        assert got["expected_phrase"] == "SMOKE-2026-09-10", got
+    # yesterday's phrase must not work today (no stale replay)
+    assert submit.gate_status(enable_submit=True, env=good_env, confirm=submit.phrase(today),
+                              now=today + timedelta(days=1))["ok"] is False
+
+
+def test_submit_non_marketable():
+    book = {"best_ask": "0.52", "best_bid": "0.50", "tick_size": "0.01"}
+    assert submit.check_non_marketable(side="BUY", price="0.50", book=book)["ok"] is True
+    assert submit.check_non_marketable(side="BUY", price="0.51", book=book)["ok"] is True
+    for price in ("0.52", "0.53", "0.90"):
+        got = submit.check_non_marketable(side="BUY", price=price, book=book)
+        assert got["reason"] == submit.NM_VIOLATION, (price, got)
+    assert submit.check_non_marketable(side="SELL", price="0.50", book=book)["reason"] == submit.NM_VIOLATION
+    assert submit.check_non_marketable(side="SELL", price="0.49", book=book)["reason"] == submit.NM_VIOLATION
+    assert submit.check_non_marketable(side="SELL", price="0.51", book=book)["ok"] is True
+
+    assert submit.check_non_marketable(side="BUY", price="0.5", book={})["reason"] == submit.NM_NO_BOOK
+    assert submit.check_non_marketable(side="BUY", price="0.5",
+                                       book={"best_ask": None})["reason"] == submit.NM_NO_BOOK
+    assert submit.check_non_marketable(side="BUY", price="0.5", book=None)["reason"] == submit.NM_NO_BOOK
+    assert submit.check_non_marketable(side="BUY", price=None, book=book)["reason"] == submit.NM_INVALID
+    assert submit.check_non_marketable(side="BUY", price="0", book=book)["reason"] == submit.NM_INVALID
+    assert submit.check_non_marketable(side="BUY", price="NaN", book=book)["reason"] == submit.NM_INVALID
+    assert submit.check_non_marketable(side="HOLD", price="0.5", book=book)["reason"] == submit.NM_INVALID
+    assert submit.check_non_marketable(side="BUY", price="0.5",
+                                       book={"best_ask": "abc"})["reason"] == submit.NM_INVALID
+    # F-B: a non-finite/負 reference price is a fail-closed deny, never an exception
+    for bad_reference in ("NaN", "Infinity", "-Infinity", "-1", "0"):
+        try:
+            got = submit.check_non_marketable(side="BUY", price="0.5", book={"best_ask": bad_reference})
+        except Exception as exc:  # noqa: BLE001 - raising is the bug being fixed
+            raise AssertionError(f"best_ask={bad_reference!r} raised {type(exc).__name__}: {exc}") from None
+        assert got["ok"] is False and got["reason"] == submit.NM_INVALID, (bad_reference, got)
+        got = submit.check_non_marketable(side="SELL", price="0.5", book={"best_bid": bad_reference})
+        assert got["ok"] is False and got["reason"] == submit.NM_INVALID, (bad_reference, got)
+
+
+def test_submit_limits():
+    base = dict(notional_usdc="5", fire_budget_usdc="10", committed_usdc="100", max_capital_usdc="500")
+    assert submit.check_limits(**base)["ok"] is True
+    assert submit.check_limits(**{**base, "notional_usdc": "10"})["ok"] is True
+    assert submit.check_limits(**{**base, "notional_usdc": "10.01"})["reason"] == submit.LIMIT_FIRE_BUDGET
+    assert submit.check_limits(**{**base, "committed_usdc": "496"})["reason"] == submit.LIMIT_CAPITAL_CAP
+    assert submit.check_limits(**{**base, "committed_usdc": "495"})["ok"] is True
+    for broken in ({"notional_usdc": None}, {"fire_budget_usdc": None}, {"committed_usdc": None},
+                   {"max_capital_usdc": None}, {"notional_usdc": "abc"}, {"notional_usdc": "-1"},
+                   {"max_capital_usdc": "NaN"}):
+        got = submit.check_limits(**{**base, **broken})
+        assert got["ok"] is False and got["reason"] == submit.LIMIT_INVALID, (broken, got)
+
+
+# --------------------------------------------------------------------------- Phase 3: sentinels
+
+def test_submit_order_audits_itself():
+    """F-D: the channel module — not its caller — owns the submit/cancel audit records."""
+    client = _SmokeClient()
+    good = submit.gate_status(enable_submit=True, env={"LIVE_SUBMIT_ENABLED": "1"},
+                              confirm=submit.phrase())
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        with _stub_clob_types(), _audit_path(log):
+            result = submit.submit_order(client, token_id="TOK-1", price="0.50", size="10",
+                                         side="BUY", tick="0.01", neg_risk=True, gates=good)
+            lines = _audit_lines(log)
+            assert [line["action"] for line in lines] == ["intent", "submit"], lines
+            assert result["ok"] is True and result["order_id"] == "ORD-1"
+            assert result["audited"] is True, result
+            assert lines[0]["reason"] == "submit_order" and lines[0]["params"]["token_id"] == "TOK-1"
+            assert lines[1]["order_id"] == "ORD-1" and lines[1]["response_summary"]["status"] == "live"
+            assert [call[0] for call in client.calls] == ["create_order", "post_order"], client.calls
+            cancelled = submit.cancel_order(client, "ORD-1")
+        assert cancelled["ok"] is True and cancelled["audited"] is True
+        assert [line["action"] for line in _audit_lines(log)] == ["intent", "submit", "intent", "cancel"]
+
+        # the pre-action audit is mandatory for the dangerous direction: no log ⇒ no order
+        before = list(client.calls)
+        with contextlib.redirect_stderr(io.StringIO()):   # the module shouts on stderr by design
+            with _audit_path(Path(tmp)):                  # a directory is not writable ⇒ AuditError
+                try:
+                    submit.submit_order(client, token_id="TOK-1", price="0.50", size="10", gates=good)
+                except submit.AuditError as exc:
+                    assert "cannot append" in str(exc), exc
+                else:
+                    raise AssertionError("an unwritable audit log must block submit_order")
+            assert client.calls == before, f"nothing signed/sent without an audit trail: {client.calls}"
+
+            # cancelling is the recovery direction: a broken log must NOT block it
+            with _audit_path(Path(tmp)):
+                rescue = submit.cancel_order(client, "ORD-2")
+        assert rescue["ok"] is True and rescue["audited"] is False, rescue
+
+        # and a gates-less refusal is audited too
+        with _audit_path(log):
+            try:
+                submit.submit_order(client, token_id="T", price="0.5", size="1", gates=None)
+            except PermissionError:
+                pass
+        assert [line["reason"] for line in _audit_lines(log)][-1] == "gates_missing"
+
+
+def test_submit_sentinels_least_privilege():
+    client_names, _ = _surface_names("ClobClient")
+    rfq_names, _ = _surface_names("RfqClient")
+    client = _surface(client_names)
+    client.rfq = _surface(rfq_names)
+    originals = {name: getattr(client, name) for name in submit.RELEASE_WRITE_METHODS}
+
+    armed = submit.arm_controlled_sentinels(client)
+    assert armed["armed"] is True
+    assert armed["released"] == [f"client.{name}" for name in submit.RELEASE_WRITE_METHODS], armed["released"]
+    assert armed["read_only_available"] == list(submit.RELEASE_READ_METHODS)
+    assert set(submit.ALLOWED_RELEASE) == {"post_order", "cancel", "get_order", "get_orders",
+                                           "get_trades", "get_balance_allowance"}
+    # the released writes are restored, NOT invoked (invoking post_order would be a real order)
+    for name in submit.RELEASE_WRITE_METHODS:
+        assert getattr(client, name) is originals[name], f"{name} was not restored"
+    released_proof = [p for p in armed["proof"] if p["status"] == "released"]
+    assert {p["method"] for p in released_proof} == set(submit.RELEASE_WRITE_METHODS), released_proof
+    assert all(p["invoked"] is False for p in released_proof), released_proof
+
+    # everything else must still be sentinel-blocked, proven by invoking it
+    must_stay = (set(sign_dryrun.SUBMIT_METHODS) - set(submit.RELEASE_WRITE_METHODS)) \
+        | set(sign_dryrun.ADMIN_METHODS) | set(sign_dryrun.STATE_WRITE_METHODS)
+    for name in sorted(must_stay):
+        assert f"client.{name}" in armed["still_blocked"], (name, armed["still_blocked"])
+        method = getattr(client, name)
+        assert getattr(method, "dryrun_sentinel_for", None) == name, name
+        try:
+            method()
+        except RuntimeError as exc:
+            assert "SUBMIT BLOCKED" in str(exc), exc
+        else:
+            raise AssertionError(f"{name}() was not blocked — least privilege violated")
+    for name in sign_dryrun.RFQ_SUBMIT_METHODS:
+        assert f"client.rfq.{name}" in armed["still_blocked"], name
+        try:
+            getattr(client.rfq, name)()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"client.rfq.{name}() was not blocked")
+
+    # fail closed when a released method is missing
+    class _NoPostOrder:
+        rfq = None
+    try:
+        submit.arm_controlled_sentinels(_NoPostOrder())
+    except RuntimeError as exc:
+        assert "post_order" in str(exc), exc
+    else:
+        raise AssertionError("arming without post_order must fail closed")
+
+
+# --------------------------------------------------------------------------- Phase 3: audit log
+
+def test_submit_audit_log():
+    required = {"ts_utc", "action", "reason", "params", "response_summary", "order_id"}
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "nested" / "live_events.jsonl"
+        with _audit_path(log):
+            record = submit.audit({"action": "intent", "reason": "unit_test", "order_id": "ORD-1",
+                                   "params": {"token_id": "123", "price": "0.5", "api_key": "SECRET-VALUE",
+                                              "api_secret": "SECRET-VALUE"},
+                                   "response_summary": {"status": "live"}})
+            submit.audit({"action": "gate_deny", "reason": submit.GATE_FLAG, "params": {"intent": "smoke"}})
+            lines = _audit_lines(log)
+        assert len(lines) == 2, lines
+        assert required <= set(lines[0]), sorted(required - set(lines[0]))
+        assert record["params"]["api_key"] == "<redacted>" and record["params"]["api_secret"] == "<redacted>"
+        assert "SECRET-VALUE" not in log.read_text(encoding="utf-8"), "no credential may reach the log"
+        assert record["params"]["token_id"] == "123" and record["order_id"] == "ORD-1"
+        assert lines[1]["action"] == "gate_deny", "refusals must be recorded too"
+        assert lines[0]["ts_utc"].endswith("Z") and lines[0]["phase"] == "phase3"
+        # unwritable log ⇒ refuse to act (acting without an audit trail is forbidden)
+        with _audit_path(Path(tmp)):
+            try:
+                submit.audit({"action": "intent"})
+            except submit.AuditError:
+                pass
+            else:
+                raise AssertionError("an unwritable audit log must raise AuditError")
+
+
+# --------------------------------------------------------------------------- Phase 3: smoke plan
+
+def test_smoke_plan_branches():
+    caps = {"no_max_ask": Decimal("1.0"), "yes_max_ask": Decimal("0.9")}
+    built = smoke.build_smoke_plan(book=dict(smoke.DRY_BOOK), budget_usdc="5", token_id="T", caps=caps)
+    assert built["ok"] and built["plan"]["price"] == Decimal("0.50"), built
+    assert built["plan"]["size"] == Decimal("10.00"), built["plan"]
+    assert built["plan"]["max_cost_usdc"] <= Decimal("5")
+    assert built["plan"]["side"] == "BUY"
+
+    # price rule: min(best_bid, best_ask - 2 ticks) and strictly below the ask
+    wide = {"best_ask": "0.60", "best_bid": "0.58", "tick_size": "0.01", "min_order_size": "5"}
+    assert smoke.smoke_price(wide)["price"] == Decimal("0.58")
+    thin = {"best_ask": "0.60", "best_bid": "0.591", "tick_size": "0.01", "min_order_size": "5"}
+    assert smoke.smoke_price(thin)["price"] == Decimal("0.58"), smoke.smoke_price(thin)
+
+    denies = [
+        ("no_book", {"best_ask": "0.52", "tick_size": "0.01", "min_order_size": "5"}),
+        ("no_book", {"best_bid": "0.50", "tick_size": "0.01", "min_order_size": "5"}),
+        ("no_book", {"best_bid": None, "best_ask": "0.52", "tick_size": "0.01"}),
+        ("invalid_book", {"best_bid": "0.60", "best_ask": "0.52", "tick_size": "0.01"}),
+        ("price_below_tick", {"best_bid": "0.009", "best_ask": "0.02", "tick_size": "0.01"}),
+        ("invalid_input", {"best_bid": "0.5", "best_ask": "0.52", "tick_size": "0"}),
+    ]
+    for reason, book in denies:
+        got = smoke.smoke_price(book)
+        assert got["ok"] is False and got["reason"] == reason, (book, got)
+        assert smoke.build_smoke_plan(book=book, budget_usdc="5", token_id="T",
+                                      caps=caps)["ok"] is False
+
+    # a budget below the market minimum must not plan
+    small = smoke.build_smoke_plan(book=dict(smoke.DRY_BOOK), budget_usdc="1", token_id="T", caps=caps)
+    assert small["reason"] == order_plan.BELOW_MIN_ORDER_SIZE, small
+
+    # operator override: aligned to tick, then still subject to passivity + cap
+    override = smoke.build_smoke_plan(book=dict(smoke.DRY_BOOK), budget_usdc="5", token_id="T",
+                                      caps=caps, price_override="0.49")
+    assert override["ok"] and override["plan"]["price"] == Decimal("0.49"), override
+    assert submit.check_non_marketable(side="BUY", price=override["plan"]["price"],
+                                       book=smoke.DRY_BOOK)["ok"] is True
+    marketable = smoke.build_smoke_plan(book=dict(smoke.DRY_BOOK), budget_usdc="5", token_id="T",
+                                        caps=caps, price_override="0.80")
+    assert marketable["ok"] is True, marketable          # order_plan is fine (<= cap)...
+    assert submit.check_non_marketable(side="BUY", price=marketable["plan"]["price"],
+                                       book=smoke.DRY_BOOK)["reason"] == submit.NM_VIOLATION  # ...step ④ is not
+    assert smoke.build_smoke_plan(book=dict(smoke.DRY_BOOK), budget_usdc="5", token_id="T",
+                                  caps=caps, price_override="0.95")["reason"] == order_plan.PRICE_ABOVE_CAP
+    assert smoke.build_smoke_plan(book=dict(smoke.DRY_BOOK), budget_usdc="5", token_id="T",
+                                  caps=caps, price_override="abc")["reason"] == "invalid_input"
+
+
+# --------------------------------------------------------------------------- Phase 3: smoke flow
+
+class _SmokeClient:
+    """Fake transport: records writes, serves reads. No network, no real order."""
+
+    def __init__(self, *, status="live", size_matched="0", cancel_ok=True,
+                 status_after_cancel="canceled", open_orders=(0,)):
+        self.rfq = _FakeRfq()
+        self.calls = []
+        self._status = status
+        self._size_matched = size_matched
+        self._cancel_ok = cancel_ok
+        self._status_after_cancel = status_after_cancel
+        self._open_orders = list(open_orders)
+        self.cancelled = False
+        self.list_calls = 0
+
+    # reads
+    def get_order_book(self, token_id):
+        return {"tick_size": "0.01", "min_order_size": "5", "neg_risk": False,
+                "bids": [{"price": "0.50", "size": "10"}], "asks": [{"price": "0.52", "size": "10"}]}
+
+    def get_order(self, order_id):
+        if self.cancelled:
+            return {"id": order_id, "status": self._status_after_cancel, "size_matched": "0",
+                    "price": "0.5", "original_size": "10"}
+        return {"id": order_id, "status": self._status, "size_matched": self._size_matched,
+                "price": "0.5", "original_size": "10", "asset_id": "tok"}
+
+    def get_orders(self):
+        self.list_calls += 1
+        count = self._open_orders.pop(0) if self._open_orders else 0
+        return [{"id": f"LEFTOVER-{i}", "asset_id": "tok", "side": "BUY", "price": "0.5",
+                 "original_size": "10", "size_matched": "0", "status": "live"} for i in range(count)]
+
+    def get_balance_allowance(self, params=None):
+        return {"balance": "50000000", "allowances": {}}
+
+    # released writes
+    def create_order(self, args, options):
+        self.calls.append(("create_order", args, options))
+        return "SIGNED-ORDER"
+
+    def post_order(self, signed, order_type="GTC", post_only=False):
+        self.calls.append(("post_order", signed, order_type, post_only))
+        return {"orderID": "ORD-1", "status": "live", "success": True}
+
+    def cancel(self, order_id):
+        self.calls.append(("cancel", order_id))
+        self.cancelled = True
+        if self._cancel_ok:
+            return {"canceled": [order_id], "not_canceled": {}}
+        return {"canceled": [], "not_canceled": {order_id: "already_matched"}}
+
+
+for _name in [n for n in SUBMIT_METHOD_NAMES + STATE_WRITE_METHOD_NAMES
+              if n not in ("post_order", "cancel")]:
+    setattr(_SmokeClient, _name, _MARKER(_name))
+
+
+@contextlib.contextmanager
+def _stub_clob_types():
+    """Minimal py_clob_client.clob_types so submit.submit_order runs under a stdlib interpreter."""
+    names = ("py_clob_client", "py_clob_client.clob_types")
+    saved = {name: sys.modules.get(name) for name in names}
+    pkg = types.ModuleType("py_clob_client")
+    pkg.__path__ = []
+    mod = types.ModuleType("py_clob_client.clob_types")
+
+    class OrderArgs:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class PartialCreateOrderOptions:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class OrderType:
+        GTC = "GTC"
+
+    mod.OrderArgs, mod.PartialCreateOrderOptions, mod.OrderType = OrderArgs, PartialCreateOrderOptions, OrderType
+    sys.modules["py_clob_client"] = pkg
+    sys.modules["py_clob_client.clob_types"] = mod
+    try:
+        yield
+    finally:
+        for name, module in saved.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+def _snapshot(*, ok=True, balance="50", orders=0, positions=None, value="0"):
+    positions = positions if positions is not None else []
+    return {"ok": ok, "reason": None if ok else "forced_failure", "usdc_balance": balance,
+            "open_orders": orders, "positions": positions, "positions_raw_count": len(positions),
+            "positions_value_usdc": value}
+
+
+def _patch_smoke(client, *, market=None, book=None, resolve=None):
+    """Point the smoke flow at fakes; returns a restore callable."""
+    saved = {
+        "build_client": sign_dryrun._build_client,
+        "discover": sign_dryrun.discover_market,
+        "audit": submit.AUDIT_PATH,
+    }
+    sign_dryrun._build_client = lambda creds_, **kw: client
+    sign_dryrun.discover_market = lambda *a, **kw: {
+        "market": market or {"city": "london", "local_date": "2026-09-11", "direction": "high",
+                             "bucket": "23C", "title": "t", "token_id": "TOK-1"},
+        "book": book or {"best_ask": "0.52", "best_bid": "0.50", "tick_size": "0.01",
+                         "min_order_size": "5", "neg_risk": True},
+        "attempts": [],
+    }
+    if resolve is not None:
+        submit.check_non_marketable = resolve
+
+    def restore():
+        sign_dryrun._build_client = saved["build_client"]
+        sign_dryrun.discover_market = saved["discover"]
+        submit.AUDIT_PATH = saved["audit"]
+        if resolve is not None:
+            submit.check_non_marketable = _ORIGINAL_NON_MARKETABLE
+
+    return restore
+
+
+_ORIGINAL_NON_MARKETABLE = submit.check_non_marketable
+
+
+def test_submit_order_requires_gates():
+    """The dangerous direction must be unreachable without a passing gate record."""
+    client = _SmokeClient()
+    good = submit.gate_status(enable_submit=True, env={"LIVE_SUBMIT_ENABLED": "1"},
+                              confirm=submit.phrase())
+    assert good["ok"] is True
+    with _stub_clob_types():
+        bad_gates = [None, {}, {"ok": False}, {"ok": True, "checks": {"cli_flag": True}},
+                     {"ok": True, "checks": {"cli_flag": True, "env_flag": True,
+                                             "confirm_phrase": False}}]
+        for gates in bad_gates:
+            try:
+                submit.submit_order(client, token_id="T", price="0.5", size="10", gates=gates)
+            except PermissionError as exc:
+                assert "gates must pass" in str(exc), exc
+            else:
+                raise AssertionError(f"gates={gates!r} must be refused")
+        kinds = [call[0] for call in client.calls]
+        assert kinds == [], f"nothing may be signed or sent when gates fail: {kinds}"
+        # cancelling stays available without gates — it is the recovery direction
+        assert submit.cancel_order(client, "ORD-X")["ok"] is True
+
+
+class _OpenOrderClient:
+    """Fake with a controllable open-order list (for rescue-scope and price-match tests)."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = []
+        self.rfq = None
+
+    def get_orders(self):
+        self.calls.append("get_orders")
+        return list(self.rows)
+
+    def cancel(self, order_id):
+        self.calls.append(("cancel", order_id))
+        return {"canceled": [order_id], "not_canceled": {}}
+
+
+def test_rescue_cancel_scope_and_price_match():
+    """F-A: never blind-cancel; F-C: match prices numerically, not as strings."""
+    # ① no order id and no token ⇒ refuse before any scan
+    blind = _OpenOrderClient([{"id": "X", "asset_id": "TOK-1", "price": "0.5"}])
+    with tempfile.TemporaryDirectory() as tmp, _audit_path(Path(tmp) / "log.jsonl"):
+        out = smoke.rescue_cancel(blind, order_id=None, token_id=None, price=None)
+    assert out["ok"] is False and out["reason"].startswith("no_scope"), out
+    assert blind.calls == [], f"a blind scan must not even list orders: {blind.calls}"
+
+    # ② scoped by token: scans, matches numerically ("0.50" row vs "0.5" query), skips others
+    client = _OpenOrderClient([
+        {"id": "MATCH", "asset_id": "TOK-1", "price": "0.50"},
+        {"id": "WRONG-PRICE", "asset_id": "TOK-1", "price": "0.51"},
+        {"id": "OTHER-TOKEN", "asset_id": "TOK-2", "price": "0.50"},
+        {"id": "GARBAGE-PRICE", "asset_id": "TOK-1", "price": "n/a"},
+    ])
+    with tempfile.TemporaryDirectory() as tmp, _audit_path(Path(tmp) / "log.jsonl"):
+        out = smoke.rescue_cancel(client, order_id=None, token_id="TOK-1", price="0.5")
+    assert out["ok"] is True and out["canceled"] == ["MATCH"], out
+    assert out["matched_open_orders"] == ["MATCH"], out
+    assert [call for call in client.calls if isinstance(call, tuple)] == [("cancel", "MATCH")], client.calls
+
+    # ③ no price ⇒ any order on that token (still token-scoped, never account-wide)
+    client2 = _OpenOrderClient([{"id": "A", "asset_id": "TOK-1", "price": "0.50"},
+                                {"id": "B", "asset_id": "TOK-2", "price": "0.50"}])
+    with tempfile.TemporaryDirectory() as tmp, _audit_path(Path(tmp) / "log.jsonl"):
+        out2 = smoke.rescue_cancel(client2, order_id=None, token_id="TOK-1")
+    assert out2["canceled"] == ["A"], out2
+
+    # ④ by order id: no scan needed
+    client3 = _OpenOrderClient([{"id": "Z", "asset_id": "TOK-9", "price": "0.99"}])
+    with tempfile.TemporaryDirectory() as tmp, _audit_path(Path(tmp) / "log.jsonl"):
+        out3 = smoke.rescue_cancel(client3, order_id="Z")
+    assert out3["ok"] is True and out3["strategy"] == "by_order_id", out3
+    assert "get_orders" not in client3.calls, client3.calls
+
+
+def test_smoke_never_blind_cancels_on_failure():
+    """F-A ②/③: a failure with no scope (and the read-only mode) must not touch the order book."""
+    def _explode_discover(*_a, **_k):
+        raise RuntimeError("discovery blew up before any plan existed")
+
+    def _forbidden_list(*_a, **_k):
+        raise AssertionError("rescue listed open orders without scope — blind cancel risk")
+
+    saved = (sign_dryrun.discover_market, submit.list_open_orders)
+    submit.list_open_orders = _forbidden_list
+    try:
+        with tempfile.TemporaryDirectory() as tmp, _stub_clob_types(), _audit_path(Path(tmp) / "l.jsonl"):
+            client = _SmokeClient()
+            restore = _patch_smoke(client)
+            sign_dryrun.discover_market = _explode_discover   # after the patch helper
+            try:
+                report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(), budget_usdc="5",
+                                         env=_flow_env(), sleep=lambda _s: None, attempts=1,
+                                         reconcile_fn=lambda env, **kw: _snapshot())
+            finally:
+                restore()
+            assert report["ok"] is False and report["reason"].startswith("RuntimeError"), report
+            assert report["residual_risk"] is False, report
+            assert [call[0] for call in client.calls] == [], client.calls
+            actions = [(line["action"], line["reason"]) for line in _audit_lines(Path(tmp) / "l.jsonl")]
+            assert ("rescue", "skipped_no_scope") in actions, actions
+
+            # read-only mode: same failure, still no rescue attempt
+            client2 = _SmokeClient()
+            restore = _patch_smoke(client2)
+            sign_dryrun.discover_market = _explode_discover
+            try:
+                report2 = smoke.run_smoke(budget_usdc="5", env=_flow_env(), readonly=True,
+                                          sleep=lambda _s: None, attempts=1,
+                                          reconcile_fn=lambda env, **kw: _snapshot())
+            finally:
+                restore()
+            assert report2["residual_risk"] is False and report2["exit_code"] == 2, report2
+            assert [call[0] for call in client2.calls] == [], client2.calls
+    finally:
+        sign_dryrun.discover_market, submit.list_open_orders = saved
+
+
+def test_smoke_readonly_preflight_never_writes():
+    """--readonly-preflight runs the live chain and stops before the write."""
+    client = _SmokeClient()
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        with _stub_clob_types(), _audit_path(log):
+            restore = _patch_smoke(client)
+            try:
+                report = smoke.run_smoke(budget_usdc="5", env=_flow_env(), readonly=True,
+                                         sleep=lambda _s: None, attempts=2,
+                                         reconcile_fn=lambda env, **kw: _snapshot())
+            finally:
+                restore()
+        kinds = [call[0] for call in client.calls]
+        assert kinds == [], f"read-only preflight touched the write path: {kinds}"
+        assert report["ok"] is True and report["exit_code"] == 0, report["reason"]
+        assert report["reason"] == "readonly_stop_before_submit"
+        assert report["readonly"] is True
+        assert report["plan"]["ok"] is True and report["non_marketable"]["ok"] is True
+        actions = [line["action"] for line in _audit_lines(log)]
+        assert "preflight_ok" in actions and "submit" not in actions, actions
+        # and it works with the gates unsatisfied (it cannot submit, so it needs none)
+        assert report["gates"]["ok"] is False, report["gates"]
+
+
+def test_smoke_refuses_without_gates():
+    """A missing gate must stop the run before a client is even built."""
+    def _explode(*_a, **_k):
+        raise AssertionError("client must not be built when a gate is missing")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        saved = sign_dryrun._build_client
+        sign_dryrun._build_client = _explode
+        try:
+            with _audit_path(log):
+                matrix = [
+                    (dict(enable_submit=False, env=_flow_env(), confirm=submit.phrase()), 3, "submit_flag_missing"),
+                    (dict(enable_submit=True, env=VALID_ENV, confirm=submit.phrase()), 3, "submit_env_missing"),
+                    (dict(enable_submit=True, env=_flow_env(), confirm=None), 3, "confirm_phrase_missing"),
+                    (dict(enable_submit=True, env=_flow_env(), confirm="SMOKE-1999-01-01"), 3, "confirm_phrase_mismatch"),
+                ]
+                for kwargs, code, reason in matrix:
+                    report = smoke.run_smoke(**kwargs)
+                    assert report["ok"] is False and report["exit_code"] == code, (kwargs, report)
+                    assert report["reason"] == reason, (kwargs, report["reason"])
+                    assert report["order"]["submitted"] is False
+                assert smoke.main(["--dry-plan"]) == 0
+        finally:
+            sign_dryrun._build_client = saved
+        actions = [line["action"] for line in _audit_lines(log)]
+        assert actions.count("gate_deny") == 4, actions
+        assert "plan" in actions, actions
+
+
+def test_smoke_flow_with_fakes():
+    """Full loop against a fake transport: plan → submit once → confirm → cancel → confirm → reconcile."""
+    client = _SmokeClient(status="live", size_matched="0")
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        with _stub_clob_types(), _audit_path(log):
+            restore = _patch_smoke(client)
+            try:
+                report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(),
+                                         budget_usdc="5", env=_flow_env(),
+                                         sleep=lambda _s: None, attempts=2,
+                                         reconcile_fn=lambda env, **kw: _snapshot())
+            finally:
+                restore()
+        # client calls: exactly one signing + one post, then read/cancel only
+        kinds = [call[0] for call in client.calls]
+        assert kinds.count("post_order") == 1, kinds
+        assert kinds.count("create_order") == 1, kinds
+        assert kinds.count("cancel") == 1, kinds
+        _, signed, order_type, post_only = client.calls[kinds.index("post_order")]
+        assert signed == "SIGNED-ORDER" and post_only is True, client.calls
+        _, args, _ = client.calls[kinds.index("create_order")]
+        assert args.side == "BUY" and args.token_id == "TOK-1", vars(args)
+        assert Decimal(str(args.price)) < Decimal("0.52"), vars(args)
+        assert Decimal(str(args.size)) == Decimal("10.00"), vars(args)
+
+        assert report["ok"] is True and report["exit_code"] == 0, report["reason"]
+        assert report["order"]["order_id"] == "ORD-1"
+        assert report["order"]["confirmed"]["status"] == "live"
+        assert report["order"]["status_after_cancel"] == "canceled"
+        assert report["residual_risk"] is False
+        assert report["sentinel"]["released"] == ["client.post_order", "client.cancel"]
+        assert report["risk_gate"]["allow"] is True
+        assert report["limits_check"]["ok"] is True
+        assert report["non_marketable"]["ok"] is True
+        actions = [line["action"] for line in _audit_lines(log)]
+        for expected in ("intent", "sentinel_armed", "discover", "plan", "risk", "limits",
+                         "non_marketable", "submit", "query", "cancel", "reconcile", "complete"):
+            assert expected in actions, (expected, actions)
+        assert actions.index("risk") < actions.index("plan") < actions.index("submit"), actions
+        assert actions.index("submit") < actions.index("cancel") < actions.index("reconcile"), actions
+
+
+def test_smoke_flow_denies_before_submit():
+    """Every pre-submit refusal must happen with zero write calls (nothing signed, nothing sent)."""
+    cases = [
+        ("risk_gate:max_open_positions_reached",
+         dict(env=_flow_env(LIVE_MAX_CAPITAL_USDC="0", LIVE_MAX_OPEN_POSITIONS="0"),
+              snapshot=lambda env, **kw: _snapshot())),
+        ("risk_gate:budget_exceeds_balance",
+         dict(env=_flow_env(), snapshot=lambda env, **kw: _snapshot(balance="1"))),
+        ("preflight:reconcile:forced_failure",
+         dict(env=_flow_env(), snapshot=lambda env, **kw: _snapshot(ok=False))),
+        # step ③ is a second, independent check on the *signed* notional: request a bigger
+        # plan than the configured per-fire budget (risk_gate looks at the config value)
+        ("limits:notional_exceeds_fire_budget",
+         dict(env=_flow_env(LIVE_FIRE_BUDGET_USDC="5"), budget_usdc="10",
+              snapshot=lambda env, **kw: _snapshot())),
+        # nb: check_limits' capital branch is unreachable through run_smoke (risk_gate uses the
+        # config fire budget, which is >= the plan notional) — it is covered directly above.
+        ("order_plan:price_above_cap",
+         dict(env=_flow_env(), snapshot=lambda env, **kw: _snapshot(), price_override="0.95")),
+        ("order_plan:below_min_order_size",
+         dict(env=_flow_env(), snapshot=lambda env, **kw: _snapshot(), budget_usdc="1")),
+        ("non_marketable:marketable_would_fill",
+         dict(env=_flow_env(), snapshot=lambda env, **kw: _snapshot(), price_override="0.80")),
+    ]
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        for expected, case in cases:
+            client = _SmokeClient()
+            with _stub_clob_types(), _audit_path(log):
+                restore = _patch_smoke(client)
+                try:
+                    report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(),
+                                             budget_usdc=case.get("budget_usdc", "5"),
+                                             env=case["env"], sleep=lambda _s: None, attempts=2,
+                                             price_override=case.get("price_override"),
+                                             reconcile_fn=case["snapshot"])
+                finally:
+                    restore()
+            assert report["ok"] is False and report["exit_code"] == 2, (expected, report["reason"])
+            assert report["reason"] == expected, (report["reason"], expected)
+            kinds = [call[0] for call in client.calls]
+            assert "post_order" not in kinds, f"submitted despite {expected}: {kinds}"
+            assert "create_order" not in kinds, f"signed despite {expected}: {kinds}"
+            assert report["order"]["submitted"] is False
+        actions = [line["action"] for line in _audit_lines(log)]
+        assert actions.count("deny") >= 4, actions
+        assert "submit" not in actions, actions
+
+
+def test_smoke_flow_reports_residual_risk():
+    """A failed cancel must be reported as residual risk, never as success."""
+    client = _SmokeClient(cancel_ok=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        with _stub_clob_types(), _audit_path(log):
+            restore = _patch_smoke(client)
+            try:
+                report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(), budget_usdc="5",
+                                         env=_flow_env(), sleep=lambda _s: None, attempts=2,
+                                         reconcile_fn=lambda env, **kw: _snapshot(orders=1))
+            finally:
+                restore()
+        assert report["ok"] is False and report["exit_code"] == 2
+        assert report["reason"] in ("cancel_not_confirmed", "open_orders_remain"), report["reason"]
+        assert report["residual_risk"] is True
+        assert report["order"]["order_id"] == "ORD-1"
+        assert "RESIDUAL RISK" in smoke.human_summary(report)
+
+    # an unexpected fill is a result, not residual risk — and must be loud
+    filled = _SmokeClient(status="matched", size_matched="3")
+    with tempfile.TemporaryDirectory() as tmp:
+        with _stub_clob_types(), _audit_path(Path(tmp) / "log.jsonl"):
+            restore = _patch_smoke(filled)
+            try:
+                report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(), budget_usdc="5",
+                                         env=_flow_env(), sleep=lambda _s: None, attempts=2,
+                                         reconcile_fn=lambda env, **kw: _snapshot())
+            finally:
+                restore()
+    assert report["ok"] is False and report["order"]["unexpected_fill"] == "3", report
+    assert "UNEXPECTED FILL" in smoke.human_summary(report)
+    assert [call[0] for call in filled.calls].count("cancel") == 0, "a filled order is not cancelled"
+
 CHECKS = [
     ("risk_gate: allow path", test_risk_gate_allow),
     ("risk_gate: all deny codes", test_risk_gate_deny_codes),
@@ -822,6 +1583,21 @@ CHECKS = [
     ("dry-run: sentinel coverage over client surface", test_sentinel_coverage_over_client_surface),
     ("order_plan: load_caps fails closed", test_load_caps_fails_closed),
     ("dry-run: fails closed when caps unreadable", test_dryrun_fails_closed_when_caps_unreadable),
+    ("submit: triple gate matrix", test_submit_gate_matrix),
+    ("submit: non-marketable check", test_submit_non_marketable),
+    ("submit: per-order + cumulative limits", test_submit_limits),
+    ("submit: submit_order requires passing gates", test_submit_order_requires_gates),
+    ("submit: sentinel least privilege", test_submit_sentinels_least_privilege),
+    ("submit: audit log (incl. refusals)", test_submit_audit_log),
+    ("submit: submit_order/cancel_order audit themselves", test_submit_order_audits_itself),
+    ("smoke: plan construction branches", test_smoke_plan_branches),
+    ("smoke: rescue scope + numeric price match", test_rescue_cancel_scope_and_price_match),
+    ("smoke: never blind-cancels on failure", test_smoke_never_blind_cancels_on_failure),
+    ("smoke: readonly preflight never writes", test_smoke_readonly_preflight_never_writes),
+    ("smoke: refuses without all three gates", test_smoke_refuses_without_gates),
+    ("smoke: full flow (fake transport)", test_smoke_flow_with_fakes),
+    ("smoke: pre-submit refusals write nothing", test_smoke_flow_denies_before_submit),
+    ("smoke: residual risk / unexpected fill", test_smoke_flow_reports_residual_risk),
     ("dry-run: --scenario offline artifact", test_scenario_dryrun_offline),
     ("dry-run: fail-closed paths", test_dryrun_fail_closed),
 ]

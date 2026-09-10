@@ -1,5 +1,16 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-10 — LIVE 执行层 Phase 3: 受控真实提交通道 + 冒烟单 (`live/submit.py`, `live/smoke.py`)
+
+- `live/submit.py` — 真实提交路径，受**三重闸门**保护：CLI `--enable-submit` **且** 环境变量 `LIVE_SUBMIT_ENABLED=1` **且** `--confirm SMOKE-<UTC 日期>`（防重放短语由 `--phrase` 打印）；缺一即拒（exit 3）**并写审计**。
+- 提交前置检查链：`risk_gate`（真实余额/持仓/预算）→ `order_plan`（tick 对齐/股数/上限）→ 名义额 ≤ `LIVE_FIRE_BUDGET_USDC` 且累计暴露 ≤ `LIVE_MAX_CAPITAL_USDC` → **只允许 non-marketable 限价单**（BUY 价 < best_ask、SELL 价 > best_bid，违反即拒）+ `postOnly=True` 交易所侧兜底。参考价非有限值（NaN/Inf/负）→ fail-closed。
+- **最小权限解除哨兵**：仅放出 `post_order`、`cancel` + 4 个只读方法（`get_order`/`get_orders`/`get_trades`/`get_balance_allowance`）；RFQ 六方法、凭据管理五方法、`post_heartbeat`、`drop_notifications` **保持拦截**（单测断言）。
+- **审计**：`data/live_events.jsonl` 追加式记录每个 intent / 拒绝 / 提交 / 查询 / 撤单 / 异常（**拒绝也记录**，禁止静默跳过）；`submit.py` 自身写审计，任一到达 `post_order` 的调用都伴随审计行。
+- `live/smoke.py` — 冒烟单编排（操作者用）：选取活跃桶 → 5 USDC non-marketable 限价买单 → 轮询确认挂单 → 撤单 → 确认 cancelled → 对账回到 0 挂单。失败救援**必须有范围**（`no_scope` 守卫：无 `order_id` 且无 `token_id` 时拒绝盲扫；readonly 模式不救援），撤单匹配按**数值**比较（`"0.5"` == `"0.50"`）。
+- **独立审计**（herdr impl+audit，对抗性）：首轮 NEEDS_FIX → 修复 **F-A（HIGH：救援路径在计划未生成时可盲撤账户全部挂单）** / F-C（字符串价格比较致精确撤单静默失效）/ F-B（参考价 NaN 抛异常而非 fail-closed）/ F-D（提交通道自身不写审计）→ **Delta 复审 APPROVE**（4 项全 CLOSED，6 组变异验证）。
+- **开发期间零真实订单**：`data/live_events.jsonl` 无任何 submit/cancel 动作、实时挂单 0、余额 51.713622 USDC 未变。真实冒烟单由操作者在 my155 上亲自触发（`min_order_size=5 股` 已实测）。
+
+
 ## 2026-09-10 — LIVE 执行层 Phase 2: 干跑签名（绝不提交）(`live/order_plan.py`, `live/sign_dryrun.py`)
 
 - `live/order_plan.py` — 纯函数（stdlib）：腿意图 + 盘口 + 预算 + 价格上限 ⇒ 可签名订单参数。tick 向下对齐、股数取整、`below_min_order_size` / `price_above_cap` / `insufficient_budget` / `no_book` / 非法输入（负价、NaN、None、超大值）一律 **fail-closed**；价格上限**只读**取自 `config/yes2re_reversal.json`，缺键即 `CapsError`（不得默认放行成无上限）。

@@ -153,13 +153,116 @@ $VENV live/sign_dryrun.py --scenario --confirm-dryrun --json --out /tmp/dryrun.j
 **上限读不到就拒绝**（`load_caps()` 缺键/非法/越界 → `CapsError` → `ok:false` + exit 2），
 不会退化成"无上限"。
 
+## Phase 3 — 冒烟单 (受控的真实提交通道)
+
+**性质变化**：Phase 1/2 的铁律是"写路径不可达"；Phase 3 需要一条**受控、最小**的真实写路径，
+于是要求变成：**写路径不可误触发、不可超限、每一步可审计**。整个包内只有 `live/submit.py`
+能下单/撤单（AST 单测断言：全包 **恰好一处** `post_order` 调用点、一处 `cancel` 调用点，
+其余模块不得出现写调用；`live/smoke.py` 只能经 `submit.submit_order`/`submit.cancel_order`）。
+
+### 操作手册（在 my155 上执行）
+
+```bash
+VENV=/home/da/桌面/poly-yes2/live-probe/.venv/bin/python     # 部署机上换成对应 venv
+cd /root/weatherbotyes2re
+
+# 0) 探针（不触网、不下单）
+$VENV live/submit.py --phrase        # 打印今天的确认短语 SMOKE-YYYY-MM-DD
+$VENV live/submit.py --status        # 三条闸门各自是否满足
+$VENV live/smoke.py --dry-plan       # 用合成盘口打印计划（零网络、零写路径）
+$VENV live/submit.py --open-orders   # 只读：当前挂单
+$VENV live/submit.py --audit-summary # 只读：审计日志里到底发生过什么（submit/cancel 计数与 order id）
+
+# 0b) 只读预演：跑完真实链路（找市场→风控→计划→限额→被动性）后在"写"之前停下
+#     只读网络、不可能下单、不需要三重闸门
+$VENV live/smoke.py --readonly-preflight --city london --date 2026-09-11 --direction high \
+      --budget-usdc 5
+
+# 1) 冒烟单（三重闸门全需满足）
+export LIVE_SUBMIT_ENABLED=1                      # ② 刻意不写进 .env
+$VENV live/smoke.py --enable-submit \
+      --confirm "$($VENV live/submit.py --phrase)" # ① + ③
+```
+
+预期输出（成功）：`ok=True`、`order: id=… confirmed=live after_cancel=canceled`、
+`reconcile: open_orders=0`，产物写 `data/live_smoke.json`，退出码 `0`。
+审计日志 `data/live_events.jsonl` 会依次出现
+`intent → sentinel_armed → discover → risk → plan → limits → non_marketable → submit → query → cancel → query → reconcile → complete`。
+
+### 三重闸门（为什么是三个）
+
+| # | 闸门 | 防的是什么 |
+|---|------|-----------|
+| ① | CLI `--enable-submit` | **误调用**：裸跑 `smoke.py`（cron/循环/复制来的只读命令）永远进不了写路径 |
+| ② | 环境变量 `LIVE_SUBMIT_ENABLED=1` | **误机器/误会话**：该变量刻意**不放进 `.env`**，任何只是加载 `.env` 的进程（本机排查、测试）都仍是只读；只有显式 export 的那台机器/会话被授权 |
+| ③ | `--confirm SMOKE-<UTC日期>` | **陈旧重放**：短语按 UTC 日期生成，昨天的命令行/脚本/历史记录今天必定失败，且强制操作者看一眼今天的短语 |
+
+三者缺一即拒绝，**退出码 3**，并写一条 `gate_deny` 审计记录（拒绝也必须留痕）。
+纵深防御：`submit.submit_order()` **自身**要求传入"三闸门全部通过"的记录，否则抛
+`PermissionError`（连签名都不会发生）；而 `cancel_order()` 刻意**不设**此要求 ——
+撤单是恢复方向，必须永远可用。
+
+### 提交前四道检查（顺序固定，全部通过才提交）
+
+1. `risk_gate.evaluate` — 真实余额 / 持仓数 / 已占用资金 + `LIVE_*` 上限
+2. `order_plan.plan_order` — tick 对齐、股数取整、`min_order_size`、价格上限
+3. 单笔名义额 ≤ `LIVE_FIRE_BUDGET_USDC` 且 已占用 + 名义额 ≤ `LIVE_MAX_CAPITAL_USDC`
+4. **禁止可立即成交**：BUY 价必须 **严格低于** best_ask（SELL 严格高于 best_bid）；
+   冒烟单价格 = `min(best_bid, best_ask − 2·tick)`，向下对齐到 tick，且 ≥ 1 tick；
+   下单时再叠加 `post_only=True`（交易所侧 maker-only 兜底）
+
+### 最小权限哨兵
+
+先按 Phase 2 装齐全部 21 个哨兵，然后**只解除** `post_order` + `cancel`（写）；
+`get_order`/`get_orders`/`get_trades`/`get_balance_allowance` 是只读调用（Phase 2 从未拦截，
+此处仅显式记录）。其余（全部 RFQ、凭据/授权管理、`post_heartbeat`、`drop_notifications`）
+**保持拦截**，且运行时与单测都断言其仍抛 `RuntimeError`。被解除的写方法只被"恢复/记录"，
+**不会被调用**（调用即真实下单）。
+
+### 审计日志
+
+**提交与撤单由 `live/submit.py` 自己审计**（它才是唯一的 `post_order` 调用点）：提交前的
+`intent` 记录是**强制**的——写不进去就什么都不签、不提交；提交后的 `submit` 记录为尽力而为
+（此时订单可能已在盘上，失败会打 stderr 并置 `audited=false`）。撤单方向相反：日志坏掉也
+**不阻塞**撤单（恢复优先），只打 stderr。
+
+每个动作（意图/拒绝/提交/查询/撤单/异常/救援）追加一行 JSON 到 `data/live_events.jsonl`：
+`ts_utc` / `action` / `reason` / `params`(已脱敏，键名含 key/secret/pass/priv/signature 一律 `<redacted>`)
+/ `response_summary` / `order_id`。日志写不进去 → 抛 `AuditError` 拒绝动作（没有审计就不许动手）。
+
+### 失败时的人工处置
+
+| 现象 | 含义 | 处置 |
+|------|------|------|
+| `submit_failed:*` + `residual_risk=true` | 连接断在提交中，**可能已挂上** | 立刻 `live/submit.py --open-orders`，看到同 token/价格的挂单就 `--cancel-order <id>`（仍需三重闸门） |
+| `cancel_not_confirmed` / `open_orders_remain` | 撤单未确认/仍有挂单 | 同上，必要时到 Polymarket 网页端手动撤 |
+| `unexpected_fill:size_matched=…` | 被动单竟然成交了（不该发生） | 视为**异常事件**上报；剩余挂单会被自动撤，成交部分按真实仓位对账 |
+| `verify:order_not_confirmed` | 下单后查不到 resting 状态 | 视为可能有残留挂单，按第 1 行处置 |
+| 退出码 3 | 三重闸门未满足 | 检查 `--status`，确认 `LIVE_SUBMIT_ENABLED=1` 与今天的短语 |
+| 默认候选项报 `best_bid: missing` | 该桶单边/已死（常见于当天已结算的桶） | 显式指定活跃盘口：`--city <city> --date <本地日期> --direction high`（或 `--token-id <id>`） |
+
+其他参数：`--leg buy_yes|buy_no`（默认 `buy_yes`；注意 `--direction` 是**市场方向** high/low，
+不是腿方向）、`--price <限价>`（覆盖被动价，若可成交仍会在第 ④ 步被拒）、`--json`、
+`--out <path>`（默认 `data/live_smoke.json`）。
+
+任何失败路径都会**尽力撤单**（先按 order_id，再按 token + 价格**数值**匹配挂单列表精确撤），
+并明确标注 `residual_risk`。**绝不会盲撤**：既没有 order_id 也没有 token 范围时
+`rescue_cancel()` 直接拒绝（`no_scope: refusing a blind cancel scan`）——不列单、更不撤单；
+`--readonly-preflight` 也不触发任何救援（那次调用从没下过单）。
+
+### 尚未开启的部分
+
+**真实信号接入尚未开启**：Phase 3 只到"人工触发一次冒烟单"为止。策略信号 → 下单的自动链路
+（Phase 4 放量、多城市并发、逐级放大 `LIVE_*`）**没有实现**，`live/submit.py` 也不会被
+paper 引擎调用（paper 引擎一行未改）。
+
 ## 阶段梯子
 
 | 阶段 | 内容 | 允许的动作 | 当前状态 |
 |------|------|-----------|----------|
 | **Phase 1** | 只读对账：余额/授权/挂单/持仓/出口/风控预判 | 只有 GET | ✅ 本包实现 |
 | **Phase 2** | 干跑签名：真实构建订单并本地签名，**不提交**；哨兵 + 产物不可提交 | 本地签名 + 只读 GET | ✅ 本包实现 |
-| **Phase 3** | 最小单：单城市、单腿、极小 notional，人工确认 + 对账闭环 | 首次真实下单 | 待做 |
+| **Phase 3** | 冒烟单：5 USDC 非可成交限价单，人工触发 → 查单 → 撤单 → 对账 | 三重闸门 + 最小权限写 | ✅ 本包实现（真实下单由操作者在 my155 触发） |
 | **Phase 4** | 放量：多城市并发、逐级放大 `LIVE_*` 上限 | 常态实盘 | 待做 |
 
 升级闸门（每一级都必须满足才进下一级）：Phase 1 连续 N 天 `ok=true` 且余额/挂单与人工
