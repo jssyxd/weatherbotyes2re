@@ -57,7 +57,26 @@ from typing import Any, Callable
 from local_order_book import OrderBookStateError
 from websocket_market_data import MarketStream, MarketStreamError
 
-DEFAULT_PROXY = ("192.168.1.5", 7890)
+def resolve_default_proxy() -> tuple[str, int] | None:
+    """Read proxy from standard environment variables (http(s)_proxy/all_proxy);
+    returns None if no proxy is configured (allowing direct connection)."""
+    for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        val = os.environ.get(key)
+        if val:
+            v = val.strip()
+            if "://" in v:
+                v = v.split("://", 1)[1]
+            host, _, port_str = v.partition(":")
+            port_clean = port_str.split("/")[0].strip()
+            if host and port_clean:
+                try:
+                    return (host.strip(), int(port_clean))
+                except ValueError:
+                    pass
+    return None
+
+
+DEFAULT_PROXY: tuple[str, int] | None = resolve_default_proxy()
 DEFAULT_WS_HOST = "ws-subscriptions-clob.polymarket.com"
 DEFAULT_WS_PATH = "/ws/market"
 DEFAULT_PING_INTERVAL_S = 10.0
@@ -235,6 +254,20 @@ class _Reader:
 # --------------------------------------------------------------------------- #
 
 
+def _tls_direct(host: str, port: int, timeout: float) -> socket.socket:
+    """Direct TCP -> TLS(SNI=host). Returns ssl socket."""
+    raw = socket.create_connection((host, port), timeout=timeout)
+    try:
+        raw.settimeout(timeout)
+        return ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+    except Exception:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        raise
+
+
 def _tls_via_connect(host: str, port: int, proxy_host: str, proxy_port: int, timeout: float) -> socket.socket:
     """TCP to proxy -> CONNECT host:port -> TLS(SNI=host). Returns ssl socket."""
     raw = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
@@ -370,7 +403,7 @@ class MarketSocketTransport:
         self,
         stream: MarketStream,
         *,
-        proxy: tuple[str, int] = DEFAULT_PROXY,
+        proxy: tuple[str, int] | None = None,
         host: str = DEFAULT_WS_HOST,
         path: str = DEFAULT_WS_PATH,
         port: int = 443,
@@ -382,7 +415,7 @@ class MarketSocketTransport:
         on_message: Callable[[MarketStream, str, "TransportTelemetry"], None] | None = None,
     ) -> None:
         self.stream = stream
-        self.proxy = proxy
+        self.proxy = proxy if proxy is not None else DEFAULT_PROXY
         self.host = host
         self.path = path
         self.port = port
@@ -401,14 +434,17 @@ class MarketSocketTransport:
     # -- lifecycle --------------------------------------------------------- #
 
     def _dial_and_subscribe(self) -> None:
-        """Connect through proxy, TLS-wrap, WS-upgrade, then send the market
+        """Connect through proxy or direct, TLS-wrap, WS-upgrade, then send the market
         subscription frame. Raises MarketTransportError on protocol reject;
         retries transient network faults up to connect_retries times."""
         last_exc: Exception | None = None
         for attempt in range(self.connect_retries):
             tls_sock = None
             try:
-                tls_sock = _tls_via_connect(self.host, self.port, *self.proxy, self.connect_timeout)
+                if self.proxy:
+                    tls_sock = _tls_via_connect(self.host, self.port, *self.proxy, self.connect_timeout)
+                else:
+                    tls_sock = _tls_direct(self.host, self.port, self.connect_timeout)
                 self._reader = _Reader(tls_sock)  # single buffer owns upgrade + frames
                 _ws_handshake(self._reader, self.host, self.path, self.connect_timeout)
             except MarketTransportError:
