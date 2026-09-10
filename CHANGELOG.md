@@ -1,5 +1,21 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-10 — LIVE 执行层 Phase 1: 只读对账层 (`live/`)
+
+- **新增完全独立的只读 live 侧模块**（主引擎仍硬性 paper-only；未改动任何现有模块、config 值或服务）：
+  - `live/creds.py` — `.env` 凭据读取 + 格式校验（仅掩码输出，绝不打印全值）
+  - `live/clob_client.py` — `py-clob-client` 惰性薄封装（依赖缺失时给出明确指引）
+  - `live/risk_gate.py` — 纯函数风控闸门（fail-closed，机器可读 reason 码）
+  - `live/reconcile.py` — 只读对账 CLI（余额 / 授权 / 挂单 / 持仓 / 风控评估 / 出口 IP），产出 `data/live_reconcile.json`
+  - `tests_live.py` — 14 项单测（含"无下单调用"静态断言、非 mapping env 与非法值契约用例）
+  - `live/README.md` — 运行方式 + 阶段梯子（只读对账 → 干跑签名 → 最小单 → 放量）
+- **硬保证**：`live/` 内零下单/撤单/授权写入路径（静态扫描 + 运行时出网 trace 双验，全部 GET）；fail-closed（异常 ⇒ `ok:false` + exit 2）；密钥卫生（正常与异常路径输出全量 grep 零命中）。
+- **首次实跑核账**（本机走 7890 代理、my155 直连，两路径结果一致）：USDC(pUSD) **51.713622**、4 个合约 allowance = uint256-max、挂单 0、79 条历史仓 `currentValue` 全 0（无活跃持仓）。
+- **风控参数（操作者拍板）**：`LIVE_MAX_CAPITAL_USDC=50` / `LIVE_MAX_OPEN_POSITIONS=10` / `LIVE_FIRE_BUDGET_USDC=5`（10×5=50，与资金上限自洽）。
+- **独立审计**（herdr 双 agent：impl + audit，对抗性立场）：**APPROVE**（含变异测试、链上独立复核 pUSD 余额、工作树独立性核对）；F1 契约瑕疵已闭合，F2 一行硬化同批修复。
+- **工程卫生**：`.gitignore` 增加 `.env*`——此前 `.env.bak.<ts>` 备份（含私钥）未被忽略，存在误提交风险。
+- **依赖说明**：live 侧第三方依赖仅 `py-clob-client`，装在独立 venv（本机 `~/桌面/poly-yes2/live-probe/.venv`、my155 `/root/live-probe/.venv`），仓库自身仍保持 stdlib-only。
+
 ## 2026-09-09 — Same-session double fire (追火) with symmetric NO+YES legs (da12518)
 
 - **A market key (city|date|direction) may now fire at most TWICE per day.**
