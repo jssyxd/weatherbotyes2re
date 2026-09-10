@@ -62,8 +62,9 @@
 
 ### T-1. 实盘账本初始资金对齐真实余额（本轮已加机制，待部署生效）
 - 已新增 env 覆盖 `YES2RE_INITIAL_CAPITAL_USDC`（`_r_state.load_config`，非法值 fail-closed）。
-- **部署步骤（待执行）**：my155 `.env` 加 `export YES2RE_INITIAL_CAPITAL_USDC=51.713622` → 删除 `/root/weatherbotyes2re/data/yes2re_state.json`（当前无持仓、无成交，可安全重建）→ `systemctl restart yes2re-live` → 验证 `equity.initial_capital_usdc=51.713622`。
-- 否则 live 的"当前权益"会以 config 的 600 起算，与真实账户不可比。
+- **部署步骤（已完成 2026-09-11 01:30 CST）**：my155 `.env` 加 `export YES2RE_INITIAL_CAPITAL_USDC=51.713622` → 备份并删除 `/root/weatherbotyes2re/data/yes2re_state.json`（当时无持仓/无成交）→ `systemctl restart yes2re-live` → 实测 `state initial_capital=51.713622`、`mode=live`、健康、0 持仓 ✓。
+- 配套：`~/.hermes/scripts/reversal_triage.py` 已对 **live 实例豁免** `state_initial_mismatch`（live 账本刻意以真实余额起算），改记为 warn 类 `state_initial_live_balance`；paper 实例行为不变（仍对该不一致报 CRIT）。
+- 因此 live 的"当前权益"现在与真实账户同源起算（余额 51.713622 USDC）。
 
 ### T-2. my155 WebSocket `connected=false`
 - 现状：live 实例 `websocket.connected=false`（`connect_errors=0`、订阅 2156 token），引擎退回 REST 轮询（`books_max_age_s` 正常、rules 98 正常），**不影响正确性**，只影响反应速度（WS 早拉用于抢窗口）。
