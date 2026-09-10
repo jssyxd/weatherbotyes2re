@@ -31,11 +31,12 @@ from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any
 
-if __package__ in (None, ""):  # `python3.13 live/v2_transport.py`
+if __package__ in (None, ""):  # `python3.13 live/...py` — make relative imports work
+    __package__ = "live"  # `python3.13 live/v2_transport.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from live import clob_client, creds as creds_mod, sign_dryrun, submit
+    from live import clob_client, creds as creds_mod, submit
 else:  # `python3.13 tests_port.py` / `import live.v2_transport`
-    from . import clob_client, creds as creds_mod, sign_dryrun, submit
+    from . import clob_client, creds as creds_mod, submit
 
 ZERO = Decimal("0")
 
@@ -130,11 +131,7 @@ def _py_clob_v2() -> dict[str, Any]:
 
 def sdk_available() -> bool:
     """True when ``py-clob-client-v2`` can be imported (no client is constructed)."""
-    try:
-        _py_clob_v2()
-    except RuntimeError:
-        return False
-    return True
+    return clob_client.sdk_available()
 
 
 def build_client(creds: dict, *, host: str = CLOB_HOST, chain_id: int = CHAIN_ID) -> Any:
@@ -157,6 +154,18 @@ def server_version(client) -> int | None:
 
 # --------------------------------------------------------------------------- sentinels
 
+def _sentinel(name: str):
+    """Build the function that replaces a write method (shared shape across the layer)."""
+
+    def blocked(*_args, **_kwargs):
+        raise RuntimeError(f"SUBMIT BLOCKED (dry-run): {name}() is disabled in Phase 2")
+
+    blocked.__name__ = "dryrun_sentinel"
+    blocked.__doc__ = f"sentinel standing in for {name}"
+    blocked.dryrun_sentinel_for = name
+    return blocked
+
+
 def sentinel_targets(client) -> list[tuple[str, object, tuple[str, ...]]]:
     """Every write surface reachable from the v2 client: the client and its RFQ sub-client."""
     targets = [("client", client, SUBMIT_METHODS + ADMIN_METHODS + STATE_WRITE_METHODS)]
@@ -166,17 +175,50 @@ def sentinel_targets(client) -> list[tuple[str, object, tuple[str, ...]]]:
     return targets
 
 
-def install_sentinels(client) -> dict:
-    """Arm every write method with the same sentinel factory the v1 channel uses."""
-    installed, missing = [], []
+def _walk_sentinels(client) -> tuple[list, list, list]:
+    """(armed triples, installed, missing) for every write method the client exposes."""
+    armed, installed, missing = [], [], []
     for label, target, names in sentinel_targets(client):
         for name in names:
             if getattr(target, name, None) is None:
                 missing.append(f"{label}.{name}")
                 continue
-            setattr(target, name, sign_dryrun._blocked(name))   # same sentinel factory
+            setattr(target, name, _sentinel(name))
             installed.append(f"{label}.{name}")
-    return {"installed": installed, "missing": missing, "armed": bool(installed)}
+            armed.append((label, target, name))
+    return armed, installed, missing
+
+
+def prove_sentinels(armed) -> list[dict]:
+    """Call each sentinel once and record the RuntimeError — evidence, not a claim."""
+    proofs = []
+    for label, target, name in armed:
+        method = getattr(target, name, None)
+        entry = {"target": label, "method": name,
+                 "patched": getattr(method, "dryrun_sentinel_for", None) == name}
+        try:
+            method()
+        except RuntimeError as exc:
+            entry.update({"blocked": True, "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - anything else means a broken sentinel
+            entry.update({"blocked": False, "error": f"unexpected {type(exc).__name__}: {exc}"})
+        else:
+            entry.update({"blocked": False, "error": "call returned — sentinel NOT armed"})
+        proofs.append(entry)
+    return proofs
+
+
+def install_sentinels(client) -> dict:
+    """Arm every v2 write method; the returned report carries the per-sentinel proof."""
+    armed, installed, missing = _walk_sentinels(client)
+    return {
+        "installed": installed,
+        "missing": missing,
+        "armed": bool(armed),
+        "proof": prove_sentinels(armed),
+        "statement": ("submit path unreachable: every order-submit / RFQ / credential-admin / "
+                      "state-write method raises RuntimeError"),
+    }
 
 
 def arm_controlled_sentinels(client) -> dict:
@@ -307,7 +349,7 @@ def canceled_ids(response) -> list[str]:
 
 def list_open_orders(client) -> dict:
     """Read-only: v2 open orders (``get_open_orders``; there is no ``get_orders`` in v2)."""
-    rows = client.get_open_orders() or []
+    rows = clob_client.get_open_orders(client)
     slim = [{"id": _field(row, "id"), "asset_id": _field(row, "asset_id"),
              "side": _field(row, "side"), "price": _field(row, "price"),
              "original_size": _field(row, "original_size"),
@@ -393,11 +435,26 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def _audit_best_effort(record: dict, *, audit_path=None) -> bool:
+    """Write an audit line without ever blocking the action (loud on stderr instead)."""
+    try:
+        submit.audit(record, path=audit_path)
+    except submit.AuditError as exc:  # recovery must keep working even with a broken log
+        print(f"AUDIT FAILURE: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def cancel_with_retry(client, order_id: str, *, attempts: int = 3, sleep=None, audit_path=None) -> dict:
-    """``cancel_orders([id])`` with retries; failure ⇒ explicit residual-order risk."""
+    """``cancel_orders([id])`` with retries; failure ⇒ explicit residual-order risk.
+
+    Auditing here is best-effort **by contract**: cancelling is the recovery direction, so an
+    unwritable log must not stop it (it is reported on stderr instead).
+    """
     sleep = sleep or _sleep
     tried = []
     last = None
+    audited = True
     for attempt in range(1, max(1, attempts) + 1):
         try:
             response = client.cancel_orders([str(order_id)])
@@ -412,21 +469,23 @@ def cancel_with_retry(client, order_id: str, *, attempts: int = 3, sleep=None, a
         ok = str(order_id) in canceled or bool(summary.get("canceled") or summary.get("cancelled"))
         last = {"attempt": attempt, "summary": summary, "ok": ok}
         tried.append(last)
-        submit.audit({"actor": "live/v2_transport.py", "action": "cancel",
-                      "reason": "ok" if ok else "cancel_not_confirmed",
-                      "params": {"order_id": str(order_id), "attempt": attempt},
-                      "response_summary": summary, "order_id": str(order_id)}, path=audit_path)
+        audited = _audit_best_effort(
+            {"actor": "live/v2_transport.py", "action": "cancel",
+             "reason": "ok" if ok else "cancel_not_confirmed",
+             "params": {"order_id": str(order_id), "attempt": attempt},
+             "response_summary": summary, "order_id": str(order_id)},
+            audit_path=audit_path) and audited
         if ok:
             return {"ok": True, "order_id": str(order_id), "attempts": attempt, "tried": tried,
-                    "canceled": canceled, "response_summary": summary}
+                    "canceled": canceled, "response_summary": summary, "audited": audited}
         if attempt < attempts:
             sleep(0)
     result = {"ok": False, "order_id": str(order_id), "attempts": attempts, "tried": tried,
-              "residual_risk": True,
+              "residual_risk": True, "audited": audited,
               "detail": f"cancel not confirmed after {attempts} attempt(s) — order may still be resting"}
-    submit.audit({"actor": "live/v2_transport.py", "action": "cancel", "reason": "residual_risk",
-                  "params": {"order_id": str(order_id), "attempts": attempts},
-                  "response_summary": last, "order_id": str(order_id)}, path=audit_path)
+    _audit_best_effort({"actor": "live/v2_transport.py", "action": "cancel", "reason": "residual_risk",
+                        "params": {"order_id": str(order_id), "attempts": attempts},
+                        "response_summary": last, "order_id": str(order_id)}, audit_path=audit_path)
     return result
 
 
@@ -493,7 +552,7 @@ def average_fill_price(client, order_id: str, *, token_id: str | None = None) ->
 def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tick=None,
                 neg_risk: bool | None = None, gates: dict | None = None, post_only: bool = True,
                 clamp: bool = True, poll_attempts: int = 6, poll_sleep: float = 1.0, sleep=None,
-                audit_path=None) -> dict:
+                audit_path=None, take_down_unfilled: bool = True) -> dict:
     """Place ONE passive limit order and reconcile the real fill. The submit never retries.
 
     ``gates`` must be a fully-passing gate record (``submit.gate_status``): the dangerous
@@ -562,7 +621,10 @@ def execute_leg(client, *, token_id: str, side: str, price, size, book=None, tic
               "terminal": fill.get("terminal"), "response_summary": summary,
               "detail": fill.get("detail", "")}
 
-    needs_takedown = (shares - filled) > ZERO and str(fill["status"]).lower() not in ("cancelled", "canceled")
+    # the engine wants "fill now or stand down", so the unfilled remainder is taken down here;
+    # the smoke order deliberately keeps it resting so the place→query→cancel loop can be tested
+    needs_takedown = take_down_unfilled and (shares - filled) > ZERO \
+        and str(fill["status"]).lower() not in ("cancelled", "canceled")
     if needs_takedown:
         takedown = cancel_with_retry(client, order_id, sleep=sleep, audit_path=audit_path)
         result["cancel"] = takedown

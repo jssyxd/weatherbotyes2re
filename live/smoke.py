@@ -32,7 +32,8 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
 
-if __package__ in (None, ""):  # `python3.13 live/smoke.py`
+if __package__ in (None, ""):  # `python3.13 live/...py` — make relative imports work
+    __package__ = "live"  # `python3.13 live/smoke.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from live import clob_client, creds as creds_mod, order_plan, reconcile, risk_gate, sign_dryrun, submit
 else:  # `python3.13 tests_live.py` / `import live.smoke`
@@ -643,7 +644,9 @@ def run_smoke(*, enable_submit: bool = False, confirm: str | None = None,
             result = submit.submit_order(
                 client, token_id=plan["token_id"], price=plan["price"], size=plan["size"],
                 side=plan["side"], tick=str(plan["tick"]), gates=gates,
-                neg_risk=bool(book.get("neg_risk")), post_only=True)
+                neg_risk=bool(book.get("neg_risk")), post_only=True,
+                # a smoke order must REST so the place→query→cancel loop is really exercised
+                take_down_unfilled=False)
         except Exception as exc:  # noqa: BLE001 - may or may not have landed ⇒ residual risk
             detail = creds_mod.sanitize(f"{type(exc).__name__}: {exc}", env)
             step("exception", "submit_failed", params={"token_id": plan["token_id"],
@@ -662,6 +665,12 @@ def run_smoke(*, enable_submit: bool = False, confirm: str | None = None,
         order_id = result["order_id"]
         report["order"].update({"order_id": order_id, "submitted": True,
                                 "response_summary": result["response_summary"]})
+        filled = result.get("filled_shares") or Decimal(0)
+        if filled > Decimal(0):
+            # a passive order must never fill: surface the real size immediately
+            report["order"]["unexpected_fill"] = str(filled)
+            report["reason"] = f"unexpected_fill:size_matched={filled}"
+            report["exit_code"] = 2
         step("submit", "ok" if order_id else "no_order_id", write_audit=False,
              params={"token_id": plan["token_id"], "price": str(plan["price"]),
                      "size": str(plan["size"]), "post_only": True},
@@ -708,6 +717,8 @@ def run_smoke(*, enable_submit: bool = False, confirm: str | None = None,
                 report["ok"] = True
                 report["exit_code"] = 0
                 report["reason"] = None
+            elif not report["reason"].startswith("unexpected_fill"):
+                report["reason"] = report["reason"] or "unexpected_fill"
 
         # ⑧ reconcile: no open orders may remain
         final = reconcile_fn(env)

@@ -29,7 +29,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-if __package__ in (None, ""):  # `python3.13 live/port.py`
+if __package__ in (None, ""):  # `python3.13 live/...py` — make relative imports work
+    __package__ = "live"  # `python3.13 live/port.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     import re_execution
     from paper_capital import reserve

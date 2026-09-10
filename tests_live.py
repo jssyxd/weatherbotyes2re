@@ -422,13 +422,13 @@ def test_static_no_order_path():
             if isinstance(node, ast.Name) and node.id in uses:
                 uses[node.id].append(f"{path.name}:{node.lineno}")
 
-    # exactly one order-placing call site per channel, and one cancel site per channel
-    assert sorted(site.split(":")[0] for site in calls["post_order"]) == sorted(WRITE_CHANNEL_MODULES), \
+    # exactly one order-placing call site in the package, and one cancel site — both in v2
+    assert sorted(site.split(":")[0] for site in calls["post_order"]) == ["v2_transport.py"], \
         calls["post_order"]
-    assert {site.split(":")[0] for site in calls["cancel"]} == {SUBMIT_MODULE}, calls["cancel"]
+    assert not calls["cancel"], f"the v1 cancel() call is gone: {calls['cancel']}"
     assert {site.split(":")[0] for site in calls["cancel_orders"]} == {"v2_transport.py"}, calls["cancel_orders"]
     assert {site.split(":")[0] for site in calls["create_order"]} == \
-        {SUBMIT_MODULE, "v2_transport.py", "sign_dryrun.py"}, calls["create_order"]
+        {"v2_transport.py", "sign_dryrun.py"}, calls["create_order"]
     # the channels' write calls may only appear as those call sites (never as values)
     for name in CHANNEL_ONLY:
         assert len(uses.get(name, [])) == len(calls[name]), (name, uses.get(name), calls[name])
@@ -454,7 +454,7 @@ def test_static_no_order_path():
                and node.func.attr in SIGN_ONLY_CALLS
                for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
     }
-    assert signers == {"sign_dryrun.py", *WRITE_CHANNEL_MODULES}, f"unexpected signing modules: {signers}"
+    assert signers == {"sign_dryrun.py", "v2_transport.py"}, f"unexpected signing modules: {signers}"
 
 
 # --------------------------------------------------------------------------- Phase 2: order_plan
@@ -595,25 +595,30 @@ def test_dryrun_fails_closed_when_caps_unreadable():
 
 # --------------------------------------------------------------------------- Phase 2: sentinels
 
-SUBMIT_METHOD_NAMES = (
-    "create_and_post_order", "post_order", "post_orders", "cancel",
-    "cancel_orders", "cancel_all", "cancel_market_orders",
-)
-RFQ_METHOD_NAMES = ("create_rfq_request", "cancel_rfq_request", "create_rfq_quote",
-                    "cancel_rfq_quote", "accept_rfq_quote", "approve_rfq_order")
-STATE_WRITE_METHOD_NAMES = ("post_heartbeat", "drop_notifications")
-
-
-class _FakeOrder:
-    def dict(self):
-        return {"salt": 1, "maker": "0xmaker", "signer": "0xsigner", "taker": "0x0",
-                "tokenId": "9" * 20, "makerAmount": "2995200", "takerAmount": "5760000",
-                "expiration": 0, "nonce": 0, "feeRateBps": 0, "side": "BUY", "signatureType": 1}
+#: the write surface is the **v2** one now (v1 orders have been rejected since 2026-04-28)
+SUBMIT_METHOD_NAMES = tuple(v2_transport.SUBMIT_METHODS)
+ADMIN_METHOD_NAMES = tuple(v2_transport.ADMIN_METHODS)
+RFQ_METHOD_NAMES = tuple(v2_transport.RFQ_SUBMIT_METHODS)
+STATE_WRITE_METHOD_NAMES = tuple(v2_transport.STATE_WRITE_METHODS)
+ALL_WRITE_METHOD_NAMES = SUBMIT_METHOD_NAMES + ADMIN_METHOD_NAMES + STATE_WRITE_METHOD_NAMES
 
 
 class _FakeSigned:
+    """Stands in for v2's ``SignedOrderV2`` (a dataclass: attributes, no ``.dict()``)."""
+
     def __init__(self, signature="0x" + "ab" * 65):
-        self.order = _FakeOrder()
+        self.salt = "1"
+        self.maker = "0xmaker"
+        self.signer = "0xsigner"
+        self.tokenId = "9" * 20
+        self.makerAmount = "2995200"
+        self.takerAmount = "5760000"
+        self.side = 0
+        self.signatureType = 1
+        self.timestamp = "1789000000000"
+        self.metadata = "0x" + "0" * 64
+        self.builder = "0x" + "0" * 64
+        self.expiration = "0"
         self.signature = signature
 
 
@@ -622,7 +627,7 @@ class _FakeRfq:
 
 
 class _FakeClient:
-    """Stands in for ClobClient — submit-class methods return a marker until the sentinels arm."""
+    """Stands in for the **v2** ClobClient — write methods return a marker until sentinels arm."""
 
     def __init__(self):
         self.rfq = _FakeRfq()
@@ -630,9 +635,20 @@ class _FakeClient:
     def create_order(self, *args, **kwargs):
         return _FakeSigned()
 
+    def post_order(self, *args, **kwargs):
+        return {"called": "post_order", "orderID": "ORD-1"}
+
+    def cancel_orders(self, *args, **kwargs):
+        return {"called": "cancel_orders", "canceled": [str(x) for x in (args[0] if args else [])]}
+
+    def get_open_orders(self):
+        return []
+
 
 _MARKER = (lambda name: lambda self, *a, **k: {"called": name})
-for _name in SUBMIT_METHOD_NAMES + STATE_WRITE_METHOD_NAMES + RFQ_METHOD_NAMES:
+for _name in ALL_WRITE_METHOD_NAMES + RFQ_METHOD_NAMES:
+    if _name in ("post_order", "cancel_orders"):        # the released writes keep real behaviour
+        continue
     setattr(_FakeRfq if _name in RFQ_METHOD_NAMES else _FakeClient, _name, _MARKER(_name))
 
 
@@ -657,7 +673,7 @@ def _restore_dryrun(originals):
 def test_sentinels_are_load_bearing():
     client = _FakeClient()
     # before arming these would happily "submit" — that is what makes the arm load-bearing
-    assert client.post_order() == {"called": "post_order"}
+    assert client.post_order().get("called") == "post_order"
     assert client.rfq.create_rfq_quote() == {"called": "create_rfq_quote"}
     before = {name: getattr(client, name) for name in SUBMIT_METHOD_NAMES}
     before_rfq = {name: getattr(client.rfq, name) for name in RFQ_METHOD_NAMES}
@@ -739,42 +755,92 @@ READ_ONLY_WHITELIST = {
     "set_api_creds": "local-only: rewrites self.creds/self.mode, zero network",
 }
 
-#: dir(ClobClient) / dir(RfqClient) snapshot (py-clob-client 0.34.6) so the coverage
-#: test also runs under a stdlib interpreter; refreshed when the library is upgraded.
-CLOB_CLIENT_METHODS = (
-    "are_orders_scoring", "assert_builder_auth", "assert_level_1_auth", "assert_level_2_auth",
-    "calculate_market_price", "can_builder_auth", "cancel", "cancel_all", "cancel_market_orders",
-    "cancel_orders", "clear_tick_size_cache", "create_and_post_order", "create_api_key",
-    "create_market_order", "create_or_derive_api_creds", "create_order", "create_readonly_api_key",
-    "delete_api_key", "delete_readonly_api_key", "derive_api_key", "drop_notifications",
-    "get_address", "get_api_keys", "get_balance_allowance", "get_builder_trades",
-    "get_closed_only_mode", "get_collateral_address", "get_conditional_address",
-    "get_exchange_address", "get_fee_rate_bps", "get_last_trade_price", "get_last_trades_prices",
-    "get_market", "get_market_trades_events", "get_markets", "get_midpoint", "get_midpoints",
-    "get_neg_risk", "get_notifications", "get_ok", "get_order", "get_order_book",
-    "get_order_book_hash", "get_order_books", "get_orders", "get_price", "get_prices",
-    "get_readonly_api_keys", "get_sampling_markets", "get_sampling_simplified_markets",
-    "get_server_time", "get_simplified_markets", "get_spread", "get_spreads", "get_tick_size",
-    "get_trades", "is_order_scoring", "post_heartbeat", "post_order", "post_orders",
-    "set_api_creds", "update_balance_allowance", "validate_readonly_api_key",
+#: dir(ClobClient) of py-clob-client-v2 (snapshot so the coverage test runs stdlib-only)
+V2_CLIENT_METHODS = (
+    "are_orders_scoring",
+    "assert_level_1_auth",
+    "assert_level_2_auth",
+    "calculate_market_price",
+    "cancel_all",
+    "cancel_market_orders",
+    "cancel_order",
+    "cancel_orders",
+    "create_and_post_market_order",
+    "create_and_post_order",
+    "create_api_key",
+    "create_builder_api_key",
+    "create_market_order",
+    "create_or_derive_api_key",
+    "create_order",
+    "create_readonly_api_key",
+    "delete_api_key",
+    "delete_readonly_api_key",
+    "derive_api_key",
+    "drop_notifications",
+    "get_address",
+    "get_api_keys",
+    "get_balance_allowance",
+    "get_builder_api_keys",
+    "get_builder_trades",
+    "get_clob_market_info",
+    "get_closed_only_mode",
+    "get_current_rewards",
+    "get_earnings_for_user_for_day",
+    "get_fee_exponent",
+    "get_fee_rate_bps",
+    "get_last_trade_price",
+    "get_last_trades_prices",
+    "get_market",
+    "get_market_trades_events",
+    "get_markets",
+    "get_midpoint",
+    "get_midpoints",
+    "get_neg_risk",
+    "get_notifications",
+    "get_ok",
+    "get_open_orders",
+    "get_order",
+    "get_order_book",
+    "get_order_book_hash",
+    "get_order_books",
+    "get_pre_migration_orders",
+    "get_price",
+    "get_prices",
+    "get_prices_history",
+    "get_raw_rewards_for_market",
+    "get_readonly_api_keys",
+    "get_reward_percentages",
+    "get_sampling_markets",
+    "get_sampling_simplified_markets",
+    "get_server_time",
+    "get_simplified_markets",
+    "get_spread",
+    "get_spreads",
+    "get_tick_size",
+    "get_total_earnings_for_user_for_day",
+    "get_trades",
+    "get_trades_paginated",
+    "get_user_earnings_and_markets_config",
+    "get_version",
+    "is_order_scoring",
+    "post_heartbeat",
+    "post_order",
+    "post_orders",
+    "revoke_builder_api_key",
+    "set_api_creds",
+    "update_balance_allowance",
 )
-RFQ_CLIENT_METHODS = (
-    "accept_rfq_quote", "approve_rfq_order", "cancel_rfq_quote", "cancel_rfq_request",
-    "create_rfq_quote", "create_rfq_request", "get_rfq_best_quote", "get_rfq_quoter_quotes",
-    "get_rfq_requester_quotes", "get_rfq_requests", "rfq_config",
-)
+#: v2 names that match a write prefix but are safe, each with the reason (audit §2.3/§8)
+V2_READ_ONLY_WHITELIST = {
+    "create_order": "local EIP-712 signing only — the v2 channel posts what this returns",
+    "create_market_order": "same local signing path (never posts by itself)",
+    "set_api_creds": "local-only: rewrites self.creds/self.mode, zero network",
+}
 
 
-def _surface_names(kind):
-    """Live reflection when py-clob-client is importable, else the recorded snapshot."""
-    try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.rfq.rfq_client import RfqClient
-    except ImportError:
-        names = CLOB_CLIENT_METHODS if kind == "ClobClient" else RFQ_CLIENT_METHODS
-        return tuple(names), "recorded snapshot"
-    cls = ClobClient if kind == "ClobClient" else RfqClient
-    return tuple(sorted(name for name in dir(cls) if not name.startswith("_"))), "live reflection"
+#: every name matching these prefixes must have a sentinel (F4 coverage)
+WRITE_PREFIXES = ("post_", "cancel_", "delete_", "update_", "create_", "drop_",
+                  "derive_", "approve_", "accept_", "set_")
 
 
 def _is_write(name):
@@ -788,32 +854,42 @@ def _surface(names):
     return obj
 
 
-def test_sentinel_coverage_over_client_surface():
-    """F4: every write-looking client method (and RFQ method) must end up sentineled."""
-    client_names, source = _surface_names("ClobClient")
-    rfq_names, _ = _surface_names("RfqClient")
-    for name, reason in READ_ONLY_WHITELIST.items():
-        assert name in client_names, f"stale whitelist entry {name!r} ({reason})"
+def _surface_names(kind):
+    """Legacy helper: the v1 surface is gone, so everything is the v2 client now."""
+    names, source = _v2_surface_names()
+    return tuple(names), source
 
-    client = _surface(client_names)
-    client.rfq = _surface(rfq_names)
-    armed = sign_dryrun.install_sentinels(client)
+
+def _v2_surface_names():
+    """Live reflection when py-clob-client-v2 is importable, else the recorded snapshot."""
+    try:
+        from py_clob_client_v2.client import ClobClient
+    except ImportError:
+        return tuple(V2_CLIENT_METHODS), "recorded snapshot"
+    return tuple(sorted(n for n in dir(ClobClient) if not n.startswith("_"))), "live reflection"
+
+
+def test_sentinel_coverage_over_client_surface():
+    """Every write-looking method of the **v2** client must end up sentineled."""
+    names, source = _v2_surface_names()
+    for name, reason in V2_READ_ONLY_WHITELIST.items():
+        assert name in names, f"stale whitelist entry {name!r} ({reason})"
+    client = _surface(names)
+    client.rfq = _surface(v2_transport.RFQ_SUBMIT_METHODS)      # v2 may add a nested rfq client
+    armed = v2_transport.install_sentinels(client)
     installed = set(armed["installed"])
     assert armed["missing"] == [], armed["missing"]
     assert all(p["blocked"] for p in armed["proof"]), armed["proof"]
 
-    expected = {f"client.{name}" for name in client_names
-                if _is_write(name) and name not in READ_ONLY_WHITELIST}
-    expected |= {f"client.rfq.{name}" for name in rfq_names
-                 if _is_write(name) and name not in READ_ONLY_WHITELIST}
+    expected = {f"client.{name}" for name in names
+                if _is_write(name) and name not in V2_READ_ONLY_WHITELIST}
+    expected |= {f"client.rfq.{name}" for name in v2_transport.RFQ_SUBMIT_METHODS if _is_write(name)}
     uncovered = expected - installed
     assert not uncovered, f"[{source}] write methods without a sentinel: {sorted(uncovered)}"
-    for name in STATE_WRITE_METHOD_NAMES:      # the two F4 additions, explicitly
+    for name in STATE_WRITE_METHOD_NAMES:      # heartbeat / notification state writes
         assert name in {entry.split(".", 1)[1] for entry in installed}, (name, installed)
     print(f"    ({source}: {len(expected)} write methods covered, "
-          f"{len(READ_ONLY_WHITELIST)} whitelisted with reasons)")
-
-
+          f"{len(V2_READ_ONLY_WHITELIST)} whitelisted with reasons)")
 def test_scenario_dryrun_offline():
     originals = _patch_dryrun()
     try:
@@ -973,15 +1049,17 @@ def test_submit_order_audits_itself():
             result = submit.submit_order(client, token_id="TOK-1", price="0.50", size="10",
                                          side="BUY", tick="0.01", neg_risk=True, gates=good)
             lines = _audit_lines(log)
-            assert [line["action"] for line in lines] == ["intent", "submit"], lines
+            # v2 audits intent+submit, and takes the unfilled remainder down (engine default)
+            assert [line["action"] for line in lines][:2] == ["intent", "submit"], lines
             assert result["ok"] is True and result["order_id"] == "ORD-1"
             assert result["audited"] is True, result
-            assert lines[0]["reason"] == "submit_order" and lines[0]["params"]["token_id"] == "TOK-1"
-            assert lines[1]["order_id"] == "ORD-1" and lines[1]["response_summary"]["status"] == "live"
-            assert [call[0] for call in client.calls] == ["create_order", "post_order"], client.calls
+            assert lines[0]["reason"] == "execute_leg" and lines[0]["params"]["token_id"] == "TOK-1"
+            assert lines[1]["order_id"] == "ORD-1" and lines[1]["response_summary"]["orderID"] == "ORD-1"
+            assert [call[0] for call in client.calls][:2] == ["create_order", "post_order"], client.calls
             cancelled = submit.cancel_order(client, "ORD-1")
         assert cancelled["ok"] is True and cancelled["audited"] is True
-        assert [line["action"] for line in _audit_lines(log)] == ["intent", "submit", "intent", "cancel"]
+        after = [line["action"] for line in _audit_lines(log)]
+        assert after[:2] == ["intent", "submit"] and after[-1] == "cancel", after
 
         # the pre-action audit is mandatory for the dangerous direction: no log ⇒ no order
         before = list(client.calls)
@@ -1010,24 +1088,28 @@ def test_submit_order_audits_itself():
 
 
 def test_submit_sentinels_least_privilege():
-    client_names, _ = _surface_names("ClobClient")
-    rfq_names, _ = _surface_names("RfqClient")
+    client_names, _ = _v2_surface_names()
     client = _surface(client_names)
-    client.rfq = _surface(rfq_names)
+    client.rfq = _surface(v2_transport.RFQ_SUBMIT_METHODS)
     originals = {name: getattr(client, name) for name in submit.RELEASE_WRITE_METHODS}
 
     armed = submit.arm_controlled_sentinels(client)
     assert armed["armed"] is True
     assert armed["released"] == [f"client.{name}" for name in submit.RELEASE_WRITE_METHODS], armed["released"]
     assert armed["read_only_available"] == list(submit.RELEASE_READ_METHODS)
-    assert set(submit.ALLOWED_RELEASE) == {"post_order", "cancel", "get_order", "get_orders",
-                                           "get_trades", "get_balance_allowance"}
+    assert set(submit.RELEASE_WRITE_METHODS) == set(v2_transport.RELEASE_WRITE_METHODS), \
+        submit.RELEASE_WRITE_METHODS
+    assert set(submit.ALLOWED_RELEASE) == set(v2_transport.RELEASE_WRITE_METHODS
+                                              + v2_transport.RELEASE_READ_METHODS), submit.ALLOWED_RELEASE
+    assert "cancel_orders" in submit.RELEASE_WRITE_METHODS and "cancel" not in submit.RELEASE_WRITE_METHODS
     # the released writes are restored, NOT invoked (invoking post_order would be a real order)
     for name in submit.RELEASE_WRITE_METHODS:
         assert getattr(client, name) is originals[name], f"{name} was not restored"
-    released_proof = [p for p in armed["proof"] if p["status"] == "released"]
+    released_proof = [p for p in armed["proof"] if p.get("status") == "released"]
     assert {p["method"] for p in released_proof} == set(submit.RELEASE_WRITE_METHODS), released_proof
-    assert all(p["invoked"] is False for p in released_proof), released_proof
+    assert all(p.get("status") == "released" for p in released_proof), released_proof
+    blocked_proof = [p for p in armed["proof"] if p.get("status") == "blocked"]
+    assert blocked_proof and all("SUBMIT BLOCKED" in p.get("error", "") for p in blocked_proof)
 
     # everything else must still be sentinel-blocked, proven by invoking it
     must_stay = (set(sign_dryrun.SUBMIT_METHODS) - set(submit.RELEASE_WRITE_METHODS)) \
@@ -1145,8 +1227,19 @@ def test_smoke_plan_branches():
 
 # --------------------------------------------------------------------------- Phase 3: smoke flow
 
+class _BookSummary:
+    """Minimal v2 OrderBookSummary look-alike (attribute access, like the real client)."""
+
+    def __init__(self, *, bid="0.50", ask="0.52", tick="0.01", min_size="5", neg_risk=False):
+        self.tick_size = tick
+        self.min_order_size = min_size
+        self.neg_risk = neg_risk
+        self.bids = [] if bid is None else [{"price": bid, "size": "100"}]
+        self.asks = [] if ask is None else [{"price": ask, "size": "100"}]
+
+
 class _SmokeClient:
-    """Fake transport: records writes, serves reads. No network, no real order."""
+    """Fake v2 client: records writes, serves reads. No network, no real order."""
 
     def __init__(self, *, status="live", size_matched="0", cancel_ok=True,
                  status_after_cancel="canceled", open_orders=(0,)):
@@ -1162,8 +1255,7 @@ class _SmokeClient:
 
     # reads
     def get_order_book(self, token_id):
-        return {"tick_size": "0.01", "min_order_size": "5", "neg_risk": False,
-                "bids": [{"price": "0.50", "size": "10"}], "asks": [{"price": "0.52", "size": "10"}]}
+        return _BookSummary(bid="0.50", ask="0.52")
 
     def get_order(self, order_id):
         if self.cancelled:
@@ -1172,11 +1264,14 @@ class _SmokeClient:
         return {"id": order_id, "status": self._status, "size_matched": self._size_matched,
                 "price": "0.5", "original_size": "10", "asset_id": "tok"}
 
-    def get_orders(self):
+    def get_open_orders(self):
         self.list_calls += 1
         count = self._open_orders.pop(0) if self._open_orders else 0
         return [{"id": f"LEFTOVER-{i}", "asset_id": "tok", "side": "BUY", "price": "0.5",
                  "original_size": "10", "size_matched": "0", "status": "live"} for i in range(count)]
+
+    def get_trades(self):
+        return []
 
     def get_balance_allowance(self, params=None):
         return {"balance": "50000000", "allowances": {}}
@@ -1190,27 +1285,28 @@ class _SmokeClient:
         self.calls.append(("post_order", signed, order_type, post_only))
         return {"orderID": "ORD-1", "status": "live", "success": True}
 
-    def cancel(self, order_id):
-        self.calls.append(("cancel", order_id))
+    def cancel_orders(self, order_ids):
+        order_id = (list(order_ids) or [""])[0]
+        self.calls.append(("cancel_orders", order_id))
         self.cancelled = True
         if self._cancel_ok:
             return {"canceled": [order_id], "not_canceled": {}}
         return {"canceled": [], "not_canceled": {order_id: "already_matched"}}
 
 
-for _name in [n for n in SUBMIT_METHOD_NAMES + STATE_WRITE_METHOD_NAMES
-              if n not in ("post_order", "cancel")]:
+for _name in [n for n in ALL_WRITE_METHOD_NAMES
+              if n not in ("post_order", "cancel_orders")]:
     setattr(_SmokeClient, _name, _MARKER(_name))
 
 
 @contextlib.contextmanager
 def _stub_clob_types():
-    """Minimal py_clob_client.clob_types so submit.submit_order runs under a stdlib interpreter."""
-    names = ("py_clob_client", "py_clob_client.clob_types")
+    """Minimal ``py_clob_client_v2`` so the v2 write channel runs under a stdlib interpreter."""
+    names = ("py_clob_client_v2", "py_clob_client_v2.clob_types", "py_clob_client_v2.client")
     saved = {name: sys.modules.get(name) for name in names}
-    pkg = types.ModuleType("py_clob_client")
+    pkg = types.ModuleType("py_clob_client_v2")
     pkg.__path__ = []
-    mod = types.ModuleType("py_clob_client.clob_types")
+    mod = types.ModuleType("py_clob_client_v2.clob_types")
 
     class OrderArgs:
         def __init__(self, **kwargs):
@@ -1223,9 +1319,28 @@ def _stub_clob_types():
     class OrderType:
         GTC = "GTC"
 
-    mod.OrderArgs, mod.PartialCreateOrderOptions, mod.OrderType = OrderArgs, PartialCreateOrderOptions, OrderType
-    sys.modules["py_clob_client"] = pkg
-    sys.modules["py_clob_client.clob_types"] = mod
+    class ApiCreds:
+        def __init__(self, *args):
+            self.args = args
+
+    class AssetType:
+        COLLATERAL = "COLLATERAL"
+
+    class BalanceAllowanceParams:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    mod.OrderArgs = OrderArgs
+    mod.PartialCreateOrderOptions = PartialCreateOrderOptions
+    mod.OrderType = OrderType
+    mod.ApiCreds = ApiCreds
+    mod.AssetType = AssetType
+    mod.BalanceAllowanceParams = BalanceAllowanceParams
+    client_mod = types.ModuleType("py_clob_client_v2.client")
+    client_mod.ClobClient = _FakeClient
+    sys.modules["py_clob_client_v2"] = pkg
+    sys.modules["py_clob_client_v2.clob_types"] = mod
+    sys.modules["py_clob_client_v2.client"] = client_mod
     try:
         yield
     finally:
@@ -1308,12 +1423,13 @@ class _OpenOrderClient:
         self.calls = []
         self.rfq = None
 
-    def get_orders(self):
-        self.calls.append("get_orders")
+    def get_open_orders(self):
+        self.calls.append("get_open_orders")
         return list(self.rows)
 
-    def cancel(self, order_id):
-        self.calls.append(("cancel", order_id))
+    def cancel_orders(self, order_ids):
+        order_id = (list(order_ids) or [""])[0]
+        self.calls.append(("cancel_orders", order_id))
         return {"canceled": [order_id], "not_canceled": {}}
 
 
@@ -1337,7 +1453,7 @@ def test_rescue_cancel_scope_and_price_match():
         out = smoke.rescue_cancel(client, order_id=None, token_id="TOK-1", price="0.5")
     assert out["ok"] is True and out["canceled"] == ["MATCH"], out
     assert out["matched_open_orders"] == ["MATCH"], out
-    assert [call for call in client.calls if isinstance(call, tuple)] == [("cancel", "MATCH")], client.calls
+    assert [call for call in client.calls if isinstance(call, tuple)] == [("cancel_orders", "MATCH")], client.calls
 
     # ③ no price ⇒ any order on that token (still token-scoped, never account-wide)
     client2 = _OpenOrderClient([{"id": "A", "asset_id": "TOK-1", "price": "0.50"},
@@ -1351,7 +1467,7 @@ def test_rescue_cancel_scope_and_price_match():
     with tempfile.TemporaryDirectory() as tmp, _audit_path(Path(tmp) / "log.jsonl"):
         out3 = smoke.rescue_cancel(client3, order_id="Z")
     assert out3["ok"] is True and out3["strategy"] == "by_order_id", out3
-    assert "get_orders" not in client3.calls, client3.calls
+    assert "get_open_orders" not in client3.calls, client3.calls
 
 
 # ---------------------------------------------------------------- Phase 3b: port + v2 transport
@@ -1723,7 +1839,7 @@ def test_smoke_flow_with_fakes():
         kinds = [call[0] for call in client.calls]
         assert kinds.count("post_order") == 1, kinds
         assert kinds.count("create_order") == 1, kinds
-        assert kinds.count("cancel") == 1, kinds
+        assert kinds.count("cancel_orders") == 1, kinds        # smoke takes its own order down
         _, signed, order_type, post_only = client.calls[kinds.index("post_order")]
         assert signed == "SIGNED-ORDER" and post_only is True, client.calls
         _, args, _ = client.calls[kinds.index("create_order")]
@@ -1736,7 +1852,8 @@ def test_smoke_flow_with_fakes():
         assert report["order"]["confirmed"]["status"] == "live"
         assert report["order"]["status_after_cancel"] == "canceled"
         assert report["residual_risk"] is False
-        assert report["sentinel"]["released"] == ["client.post_order", "client.cancel"]
+        assert report["sentinel"]["released"] == ["client.post_order", "client.cancel_orders"], \
+        report["sentinel"]["released"]
         assert report["risk_gate"]["allow"] is True
         assert report["limits_check"]["ok"] is True
         assert report["non_marketable"]["ok"] is True
@@ -1829,7 +1946,7 @@ def test_smoke_flow_reports_residual_risk():
                 restore()
     assert report["ok"] is False and report["order"]["unexpected_fill"] == "3", report
     assert "UNEXPECTED FILL" in smoke.human_summary(report)
-    assert [call[0] for call in filled.calls].count("cancel") == 0, "a filled order is not cancelled"
+    assert [call[0] for call in filled.calls].count("cancel_orders") == 0, "a filled order is not cancelled"
 
 CHECKS = [
     ("risk_gate: allow path", test_risk_gate_allow),

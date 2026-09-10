@@ -31,12 +31,14 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
-if __package__ in (None, ""):  # `python3.13 live/sign_dryrun.py`
+if __package__ in (None, ""):  # `python3.13 live/...py` — make relative imports work
+    __package__ = "live"  # `python3.13 live/sign_dryrun.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from live import clob_client, creds as creds_mod, order_plan
+    from live import clob_client, creds as creds_mod, order_plan, v2_transport
 else:  # `python3.13 tests_live.py` / `import live.sign_dryrun`
-    from . import clob_client, creds as creds_mod, order_plan
+    from . import clob_client, creds as creds_mod, order_plan, v2_transport
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = Path("data/live_order_dryrun.json")
@@ -45,42 +47,11 @@ CITIES_PATH = ROOT / "config" / "contract_cities.json"
 GAMMA_EVENT_ENDPOINT = "https://gamma-api.polymarket.com/events/slug/"
 
 CHAIN_ID = 137
-#: order-submit methods — these MUST exist and MUST be blocked, else the dry run refuses
-SUBMIT_METHODS = (
-    "create_and_post_order",
-    "post_order",
-    "post_orders",
-    "cancel",
-    "cancel_orders",
-    "cancel_all",
-    "cancel_market_orders",
-)
-#: RFQ is a second order-entry surface on the same client (best-effort: blocked when present)
-RFQ_SUBMIT_METHODS = (
-    "create_rfq_request",
-    "cancel_rfq_request",
-    "create_rfq_quote",
-    "cancel_rfq_quote",
-    "accept_rfq_quote",
-    "approve_rfq_order",
-)
-#: credential / allowance administration — not order entry, but destructive
-ADMIN_METHODS = (
-    "create_api_key",
-    "derive_api_key",
-    "delete_api_key",
-    "create_readonly_api_key",
-    "delete_readonly_api_key",
-    "update_balance_allowance",
-)
-
-#: account-state writes that are neither order entry nor credential admin, yet still mutate
-#: server state: ``post_heartbeat`` POSTs /v1/heartbeats (its own docstring warns it can take
-#: every resting order down) and ``drop_notifications`` DELETEs /notifications.
-STATE_WRITE_METHODS = (
-    "post_heartbeat",
-    "drop_notifications",
-)
+#: the v2 write surface, owned by the single v2 channel (no duplicated lists to drift)
+SUBMIT_METHODS = v2_transport.SUBMIT_METHODS
+RFQ_SUBMIT_METHODS = v2_transport.RFQ_SUBMIT_METHODS
+ADMIN_METHODS = v2_transport.ADMIN_METHODS
+STATE_WRITE_METHODS = v2_transport.STATE_WRITE_METHODS
 
 #: offline synthetic market for `--scenario` (no network, no real token)
 SCENARIO = {
@@ -109,45 +80,20 @@ def _apply_proxy_env(env: dict) -> None:
 
 # --------------------------------------------------------------------------- sentinels
 
+#: the sentinel factory lives in the v2 channel now (same shape as before)
 def _blocked(name: str):
-    """Build the sentinel that replaces a submit-class client method."""
-
-    def blocked(*_args, **_kwargs):
-        raise RuntimeError(f"SUBMIT BLOCKED (dry-run): {name}() is disabled in Phase 2")
-
-    blocked.__name__ = "dryrun_sentinel"
-    blocked.__doc__ = f"dry-run sentinel standing in for {name}"
-    blocked.dryrun_sentinel_for = name
-    return blocked
+    """Backwards-compatible alias: the sentinel factory is owned by ``live/v2_transport.py``."""
+    return v2_transport._sentinel(name)
 
 
 def sentinel_targets(client) -> list[tuple[str, object, tuple[str, ...]]]:
-    """Every write surface reachable from the client: the client and its RFQ sub-client."""
-    targets = [("client", client, SUBMIT_METHODS + ADMIN_METHODS + STATE_WRITE_METHODS)]
-    rfq = getattr(client, "rfq", None)
-    if rfq is not None:
-        targets.append(("client.rfq", rfq, RFQ_SUBMIT_METHODS))
-    return targets
+    """Every write surface reachable from the client (v2 lists; delegated)."""
+    return v2_transport.sentinel_targets(client)
 
 
 def install_sentinels(client) -> dict:
-    """Replace every write-capable method with a blocking sentinel. Returns the armed set."""
-    installed, missing, armed = [], [], []
-    for label, target, names in sentinel_targets(client):
-        for name in names:
-            if getattr(target, name, None) is None:
-                missing.append(f"{label}.{name}")
-                continue
-            setattr(target, name, _blocked(name))
-            installed.append(f"{label}.{name}")
-            armed.append((label, target, name))
-    return {
-        "installed": installed,
-        "missing": missing,
-        "armed": bool(armed),
-        "proof": prove_sentinels(armed),
-        "statement": "submit path unreachable: every order-submit / RFQ / credential-admin / state-write method raises RuntimeError",
-    }
+    """Replace every write-capable method with a blocking sentinel (delegated to v2)."""
+    return v2_transport.install_sentinels(client)
 
 
 def prove_sentinels(armed) -> list[dict]:
@@ -218,27 +164,37 @@ def candidate_sessions(state_path: Path | None = None, *, today: str | None = No
 
 
 def _book_from_summary(summary) -> dict:
-    """Normalise a CLOB OrderBookSummary into the book shape order_plan consumes."""
+    """Normalise a v2 order book into the shape order_plan / clamp_limit consume.
+
+    v2's ``get_order_book`` answers with a **dict** (``bids``/``asks``/``tick_size``/
+    ``min_order_size``/``neg_risk``); the SDK also ships an ``OrderBookSummary`` dataclass, so
+    both shapes are accepted here.
+    """
+    def _get(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
     def levels(rows):
         out = []
         for row in rows or []:
-            price = getattr(row, "price", None) if not isinstance(row, dict) else row.get("price")
-            size = getattr(row, "size", None) if not isinstance(row, dict) else row.get("size")
+            price = row.get("price") if isinstance(row, dict) else getattr(row, "price", None)
+            size = row.get("size") if isinstance(row, dict) else getattr(row, "size", None)
             if price is not None:
                 out.append({"price": str(price), "size": str(size)})
         return out
 
-    # CLOB /book returns bids ascending and asks descending (worst-first), so the best
-    # ask is the *minimum* ask and the best bid the *maximum* bid — the same convention
-    # as clob_market_data.BookSnapshot.best_ask/best_bid.
-    bids = sorted(levels(getattr(summary, "bids", None)), key=lambda r: Decimal(r["price"]), reverse=True)
-    asks = sorted(levels(getattr(summary, "asks", None)), key=lambda r: Decimal(r["price"]))
+    # CLOB /book returns bids ascending and asks descending (worst-first), so the best ask is
+    # the *minimum* ask and the best bid the *maximum* bid — the same convention as
+    # clob_market_data.BookSnapshot.best_ask/best_bid.
+    bids = sorted(levels(_get(summary, "bids")), key=lambda r: Decimal(r["price"]), reverse=True)
+    asks = sorted(levels(_get(summary, "asks")), key=lambda r: Decimal(r["price"]))
     return {
         "best_bid": bids[0]["price"] if bids else None,
         "best_ask": asks[0]["price"] if asks else None,
-        "tick_size": getattr(summary, "tick_size", None),
-        "min_order_size": getattr(summary, "min_order_size", None),
-        "neg_risk": bool(getattr(summary, "neg_risk", False)),
+        "tick_size": _get(summary, "tick_size"),
+        "min_order_size": _get(summary, "min_order_size"),
+        "neg_risk": bool(_get(summary, "neg_risk", False)),
         "bids": bids[:5],
         "asks": asks[:5],
     }
@@ -339,78 +295,94 @@ def _build_client(creds) -> object:
 
 
 def _sign(client, plan, creds, *, offline: bool):
-    """Sign one order. ``offline`` uses the local EIP-712 builder (no network at all)."""
+    """Sign one order with the **v2** SDK. ``offline`` uses v2's local builder (no network).
+
+    Signing only — the dry run never reaches ``post_order`` (the sentinels plus the AST guard
+    make that structural, not a convention).
+    """
     if offline:
         return _offline_signed_order(creds, plan)
-    from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
-
-    args = OrderArgs(token_id=plan["token_id"], price=float(plan["price"]), size=float(plan["size"]),
-                     side=plan["side"], fee_rate_bps=0)
-    options = PartialCreateOrderOptions(tick_size=str(plan["tick"]), neg_risk=bool(plan.get("neg_risk")))
+    lib = clob_client._py_clob_v2()
+    args = lib["OrderArgs"](token_id=plan["token_id"], price=float(plan["price"]),
+                            size=float(plan["size"]), side=plan["side"])
+    options = lib["PartialCreateOrderOptions"](tick_size=str(plan["tick"]),
+                                               neg_risk=bool(plan.get("neg_risk")))
     return client.create_order(args, options)
 
 
 def _offline_signed_order(creds, plan):
-    """Local-only mirror of py-clob-client's signing path (used by --scenario)."""
-    from py_clob_client.clob_types import RoundConfig  # noqa: F401  (import guard: venv-only dep)
-    from py_clob_client.constants import POLYGON, ZERO_ADDRESS
-    from py_clob_client.order_builder.builder import ROUNDING_CONFIG, OrderBuilder
-    from py_clob_client.signer import Signer
-    from py_order_utils.builders import OrderBuilder as UtilsOrderBuilder
-    from py_order_utils.model import OrderData
-    from py_order_utils.signer import Signer as UtilsSigner
+    """Local-only v2 signing for ``--scenario`` (v2's own builder; zero network).
+
+    Mirrors what ``ClobClient.create_order`` does, minus the tick/fee/version lookups that
+    need the wire: the caller supplies the tick and neg_risk from the (synthetic) book.
+    """
+    from py_clob_client_v2.clob_types import OrderArgs, PartialCreateOrderOptions
+    from py_clob_client_v2.order_builder.builder import OrderBuilder
+    from py_clob_client_v2.signer import Signer
 
     tick = str(plan["tick"])
-    rounding = ROUNDING_CONFIG.get(tick)
-    if rounding is None:
-        raise RuntimeError(f"unsupported tick {tick!r} for offline signing")
-    builder = OrderBuilder(Signer(creds["private_key"], POLYGON),
-                           sig_type=creds["signature_type"], funder=creds["funder_address"])
-    side, maker_amount, taker_amount = builder.get_order_amounts(
-        plan["side"], float(plan["size"]), float(plan["price"]), rounding
-    )
-    data = OrderData(
-        maker=builder.funder,
-        taker=ZERO_ADDRESS,
-        tokenId=str(plan["token_id"]),
-        makerAmount=str(maker_amount),
-        takerAmount=str(taker_amount),
-        side=side,
-        feeRateBps="0",
-        nonce="0",
-        signer=builder.signer.address(),
-        expiration="0",
-        signatureType=builder.sig_type,
-    )
-    contract = _contract_config(bool(plan.get("neg_risk")))
-    return UtilsOrderBuilder(contract.exchange, POLYGON, UtilsSigner(key=creds["private_key"])).build_signed_order(data)
+    builder = OrderBuilder(Signer(creds["private_key"], CHAIN_ID),
+                           signature_type=creds["signature_type"], funder=creds["funder_address"])
+    args = OrderArgs(token_id=str(plan["token_id"]), price=float(plan["price"]),
+                     size=float(plan["size"]), side=plan["side"])
+    options = PartialCreateOrderOptions(tick_size=tick, neg_risk=bool(plan.get("neg_risk")))
+    return builder.build_order(args, options)
 
 
 def _contract_config(neg_risk: bool):
-    from py_clob_client.config import get_contract_config
-    return get_contract_config(CHAIN_ID, neg_risk)
+    """v2 contract config: the EIP-712 domain uses the **v2** exchange addresses.
+
+    v2's ``get_contract_config(chain_id)`` returns both generations; a v2 order is signed
+    against ``exchange_v2`` (or ``neg_risk_exchange_v2``), which is what the order builder
+    itself uses.
+    """
+    from types import SimpleNamespace
+
+    from py_clob_client_v2.config import get_contract_config
+
+    cfg = get_contract_config(CHAIN_ID)
+    exchange = (cfg.neg_risk_exchange_v2 if neg_risk else cfg.exchange_v2)
+    return SimpleNamespace(exchange=exchange, collateral=cfg.collateral,
+                           conditional_tokens=cfg.conditional_tokens,
+                           neg_risk_exchange_v2=cfg.neg_risk_exchange_v2)
 
 
 def _order_hash(signed, creds, plan) -> str | None:
-    """EIP-712 digest (what the signature covers); degrades to None, never fails the run."""
+    """v2 EIP-712 order hash (the digest the signature covers); None when unavailable.
+
+    Informative, never load-bearing: a failure here must not fail the dry run.
+    """
     try:
-        from eth_utils import keccak
-        from py_order_utils.builders import OrderBuilder as UtilsOrderBuilder
-        from py_order_utils.signer import Signer as UtilsSigner
+        from py_clob_client_v2.order_utils.exchange_order_builder_v2 import ExchangeOrderBuilderV2
+        from py_clob_client_v2.signer import Signer
 
         contract = _contract_config(bool(plan.get("neg_risk")))
-        builder = UtilsOrderBuilder(contract.exchange, CHAIN_ID, UtilsSigner(key=creds["private_key"]))
-        order = getattr(signed, "order", None)
-        if order is None:
-            return None
-        return "0x" + keccak(order.signable_bytes(domain=builder.domain_separator)).hex()
+        builder = ExchangeOrderBuilderV2(contract.exchange, CHAIN_ID, Signer(creds["private_key"], CHAIN_ID))
+        return builder.build_order_hash(builder.build_order_typed_data(signed))
     except Exception:  # noqa: BLE001 - the hash is informative, not load-bearing
         return None
 
 
+def _signed_fields(signed) -> dict:
+    """Flatten a v2 SignedOrderV2 (dataclass) — attribute access, no ``.get()``.
+
+    The ``signature`` is deliberately **dropped**: Phase 2's artifact must stay unsubmittable
+    (presence/length/prefix are reported separately).
+    """
+    fields: dict[str, Any] = {}
+    for key, value in (vars(signed).items() if hasattr(signed, "__dict__") else []):
+        if key == "signature":
+            continue
+        fields[key] = value if isinstance(value, str) else str(value)
+    if not fields:                                   # v1-style object with .dict(), if ever seen
+        order = getattr(signed, "order", None)
+        raw = order.dict() if hasattr(order, "dict") else {}
+        fields = {key: (value if isinstance(value, str) else str(value)) for key, value in raw.items()}
+    return fields
+
+
 def _describe_signed(signed, order_hash, note: str) -> dict:
-    order = getattr(signed, "order", None)
-    raw = order.dict() if hasattr(order, "dict") else {}
+    raw = _signed_fields(signed)
     signature = getattr(signed, "signature", None) or ""
     return {
         "hash": order_hash,
@@ -419,7 +391,7 @@ def _describe_signed(signed, order_hash, note: str) -> dict:
         "signature_prefix": signature[:10] or None,
         "maker_amount": str(raw.get("makerAmount")),
         "taker_amount": str(raw.get("takerAmount")),
-        "order": {key: (value if isinstance(value, str) else str(value)) for key, value in raw.items()},
+        "order": raw,
         "note": note,
     }
 

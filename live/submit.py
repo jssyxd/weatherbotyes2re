@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Phase-3 controlled submit channel — the ONLY module in ``live/`` that can place or cancel
-a real order. Everything else in ``live/`` remains write-incapable (Phase 1/2 guarantees).
+"""Phase-3 controlled submit channel — the **safety machinery** every write goes through.
+
+This module owns the gate record, the append-only audit log, the passivity/size limits and the
+CLI used by the operator smoke order. Since Phase 3b-3 the **write primitives themselves live in
+:mod:`live.v2_transport`** (CLOB v2 — v1 orders have been rejected since 2026-04-28), and the
+functions at the bottom of this file are thin adapters that delegate to it, so there is exactly
+one ``post_order``/``cancel_orders`` call site in the package (``tests_live.py`` asserts it).
 
 Safety model (Phase 3 inverts the Phase 2 rule on purpose):
 
@@ -50,21 +55,26 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-if __package__ in (None, ""):  # `python3.13 live/submit.py`
+if __package__ in (None, ""):  # `python3.13 live/...py` — make relative imports work
+    __package__ = "live"  # `python3.13 live/submit.py`
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from live import clob_client, creds as creds_mod, order_plan, sign_dryrun
+    from live import clob_client, creds as creds_mod, order_plan
 else:  # `python3.13 tests_live.py` / `import live.submit`
-    from . import clob_client, creds as creds_mod, order_plan, sign_dryrun
+    from . import clob_client, creds as creds_mod, order_plan
+# nb: sign_dryrun / v2_transport are imported lazily inside the functions that need them —
+# the three modules reference each other, and lazy imports keep the graph acyclic.
 
 ROOT = Path(__file__).resolve().parent.parent
 AUDIT_PATH = Path("data/live_events.jsonl")
 
-#: writes this phase is allowed to perform — the narrowest set that can smoke-test the loop
-RELEASE_WRITE_METHODS = ("post_order", "cancel")
+#: writes that may be released — the narrowest set that can smoke-test the loop (**v2 names**:
+#: ``cancel_orders([id])`` is the safe cancel; the single-id ``cancel_order`` stays blocked)
+RELEASE_WRITE_METHODS = ("post_order", "cancel_orders")
 #: read-only calls the smoke loop needs (Phase 2 never sentineled reads: releasing is a no-op,
 #: recorded so the released set is explicit and auditable)
-RELEASE_READ_METHODS = ("get_order", "get_orders", "get_trades", "get_balance_allowance")
-#: everything the operator may unlock, exactly as requested
+RELEASE_READ_METHODS = ("get_order", "get_open_orders", "get_trades", "get_balance_allowance",
+                        "get_order_book", "get_tick_size")
+#: everything the operator may unlock
 ALLOWED_RELEASE = RELEASE_WRITE_METHODS + RELEASE_READ_METHODS
 
 CONFIRM_PREFIX = "SMOKE"
@@ -191,86 +201,28 @@ def audit(entry: dict, *, path: Path | None = None) -> dict:
 
 # --------------------------------------------------------------------------- sentinels
 
-def _blocked_proof(client) -> list[dict]:
-    """Walk every Phase-2 sentinel target: blocked ones are invoked (they raise before any
-    I/O); released/read ones are only inspected — never invoked, they would hit the wire."""
-    proofs = []
-    for label, target, names in sign_dryrun.sentinel_targets(client):
-        for name in names:
-            method = getattr(target, name, None)
-            if method is None:
-                continue
-            is_sentinel = getattr(method, "dryrun_sentinel_for", None) == name
-            if not is_sentinel:
-                proofs.append({"target": label, "method": name,
-                               "status": "released" if name in RELEASE_WRITE_METHODS else "not_sentineled",
-                               "invoked": False})
-                continue
-            try:
-                method()
-            except RuntimeError as exc:
-                proofs.append({"target": label, "method": name, "status": "blocked",
-                               "invoked": True, "error": str(exc)})
-            except Exception as exc:  # noqa: BLE001 - any other error is a broken sentinel
-                proofs.append({"target": label, "method": name, "status": f"unexpected:{type(exc).__name__}",
-                               "invoked": True, "error": str(exc)[:200]})
-            else:
-                proofs.append({"target": label, "method": name, "status": "NOT_BLOCKED", "invoked": True})
-    return proofs
+def sentinel_targets(client) -> list:
+    """Every write surface reachable from the client (delegated to the v2 channel)."""
+    from . import v2_transport  # local import: v2_transport imports this module
+    return v2_transport.sentinel_targets(client)
+
+
+def install_sentinels(client) -> dict:
+    """Arm every write method (delegated: one sentinel factory, one name list)."""
+    from . import v2_transport
+    return v2_transport.install_sentinels(client)
 
 
 def arm_controlled_sentinels(client) -> dict:
-    """Arm every Phase-2 sentinel, then release exactly ``RELEASE_WRITE_METHODS``.
+    """Arm everything, then release only ``RELEASE_WRITE_METHODS`` (delegated to v2)."""
+    from . import v2_transport
+    return v2_transport.arm_controlled_sentinels(client)
 
-    Fails closed when a released write method is missing (nothing to release ⇒ we would be
-    running a half-configured channel) or when anything outside the release list ends up
-    unblocked.
-    """
-    originals: dict[str, Any] = {}
-    for name in RELEASE_WRITE_METHODS:
-        original = getattr(client, name, None)
-        if original is None:
-            raise RuntimeError(f"cannot release {name}: client has no such method — refusing to arm")
-        originals[name] = original
 
-    armed = sign_dryrun.install_sentinels(client)
-    if not armed.get("armed"):
-        raise RuntimeError("no sentinels armed — refusing to continue")
-
-    for name, original in originals.items():
-        setattr(client, name, original)
-
-    proof = _blocked_proof(client)
-    still_blocked = [f"{p['target']}.{p['method']}" for p in proof if p["status"] == "blocked"]
-    bad = [p for p in proof if p["status"] not in ("blocked", "released", "not_sentineled")]
-    must_stay_blocked = {
-        f"client.{name}" for name in
-        (sign_dryrun.SUBMIT_METHODS + sign_dryrun.ADMIN_METHODS + sign_dryrun.STATE_WRITE_METHODS)
-        if name not in RELEASE_WRITE_METHODS
-    }
-    must_stay_blocked |= {f"client.rfq.{name}" for name in sign_dryrun.RFQ_SUBMIT_METHODS}
-    # a method the library does not expose cannot leak (nothing to call); a method that
-    # exists and is not blocked is a real hole.
-    present = {f"{label}.{name}" for label, target, names in sign_dryrun.sentinel_targets(client)
-               for name in names if getattr(target, name, None) is not None}
-    leaked = sorted((must_stay_blocked & present) - set(still_blocked))
-    if bad or leaked:
-        raise RuntimeError(f"sentinel release violated least privilege: bad={bad} leaked={leaked}")
-
-    released = [f"client.{name}" for name in RELEASE_WRITE_METHODS]
-    return {
-        "armed": True,
-        "released": released,
-        "read_only_available": list(RELEASE_READ_METHODS),
-        "still_blocked_count": len(still_blocked),
-        "still_blocked": still_blocked,
-        "not_sentineled": [f"{p['target']}.{p['method']}" for p in proof if p["status"] == "not_sentineled"],
-        "proof": proof,
-        "statement": (
-            "least privilege: only post_order/cancel released; all RFQ / credential-admin / "
-            "state-write methods remain sentinel-blocked; released writes are NOT invoked here"
-        ),
-    }
+def _blocked(name: str):
+    """The sentinel factory, owned by ``live/v2_transport.py`` (kept as an alias)."""
+    from . import v2_transport
+    return v2_transport._sentinel(name)
 
 
 # --------------------------------------------------------------------------- pure checks
@@ -382,59 +334,45 @@ def _summarize_cancel(response: Any) -> dict:
 
 
 def submit_order(client, *, token_id: str, price, size, side: str = "BUY", gates: dict,
-                 tick=None, neg_risk: bool | None = None, post_only: bool = True) -> dict:
-    """Sign locally, then submit exactly once. Never retries (a retry could double-fill).
+                 tick=None, neg_risk: bool | None = None, post_only: bool = True,
+                 book=None, poll_attempts: int = 6, poll_sleep: float = 1.0, sleep=None,
+                 audit_path=None, clamp: bool = True, take_down_unfilled: bool = True) -> dict:
+    """Sign + post one passive order **through the audited v2 channel**, exactly once.
 
-    ``gates`` is **mandatory** and must be a fully-passing gate record
-    (``submit.gate_status(...)``): the dangerous direction may not be reachable without
-    proof that all three gates were satisfied in this invocation. ``cancel`` is deliberately
-    *not* gated this way — cancelling is the recovery direction and must always work.
-
-    This is the single ``post_order`` call site in ``live/`` — ``tests_live.py`` asserts it.
-    A failure here is reported with ``residual_risk: True`` because we cannot know whether
-    the exchange accepted the order before the connection died; the caller must reconcile.
+    Adapter over :func:`live.v2_transport.execute_leg`: the gates record, the intent audit, the
+    pre-submit clamp, the fill reconciliation and the residual-risk reporting all live there.
+    The returned dict keeps this module's historical keys (``order_id`` / ``response_summary``)
+    so the smoke orchestration is unchanged.
     """
     if not gates_all_passed(gates):
         audit({"action": "deny", "reason": "gates_missing",
-               "params": {"intent": "submit_order", "token_id": token_id, "price": str(price)}})
+               "params": {"intent": "submit_order", "token_id": token_id, "price": str(price)}},
+              path=audit_path)
         raise PermissionError("submit_order refused: all three gates must pass in this invocation")
-
-    params = {"token_id": str(token_id), "price": str(price), "size": str(size), "side": side,
-              "tick": None if tick is None else str(tick), "post_only": post_only}
-    # mandatory pre-action audit: no audit trail ⇒ no signing, no submitting (AuditError raises)
-    audit({"action": "intent", "reason": "submit_order", "params": params})
-
-    from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
-
-    args = OrderArgs(token_id=str(token_id), price=float(price), size=float(size),
-                     side=side, fee_rate_bps=0)
-    options = PartialCreateOrderOptions(
-        tick_size=str(tick) if tick is not None else None,
-        neg_risk=bool(neg_risk) if neg_risk is not None else None,
+    from . import v2_transport  # local import: v2_transport imports this module
+    result = v2_transport.execute_leg(
+        client, token_id=str(token_id), price=price, size=size, side=side, book=book, tick=tick,
+        neg_risk=neg_risk, gates=gates, post_only=post_only, clamp=clamp,
+        poll_attempts=poll_attempts, poll_sleep=poll_sleep, sleep=sleep, audit_path=audit_path,
+        take_down_unfilled=take_down_unfilled,
     )
-    signed = client.create_order(args, options)
-    order_type = getattr(OrderType, "GTC")
-    response = client.post_order(signed, order_type, post_only=post_only)
-    order_id = _order_id_of(response)
-    summary = _summarize_post(response)
-    audited = True
-    try:
-        audit({"action": "submit", "reason": "ok" if order_id else "no_order_id",
-               "params": params, "response_summary": summary, "order_id": order_id})
-    except AuditError as exc:  # by now the order may already be live: never swallow this
-        audited = False
-        print(f"AUDIT FAILURE after submit (order_id={order_id}): {exc}", file=sys.stderr)
-    return {"ok": True, "order_id": order_id, "response_summary": summary,
-            "post_only": post_only, "audited": audited, "raw": response}
+    summary = {"status": result.get("status"), "orderID": result.get("order_id"),
+               "clamped": result.get("clamped"), "limit_price": result.get("limit_price")}
+    return {"ok": bool(result.get("ok")), "order_id": result.get("order_id"),
+            "response_summary": summary, "post_only": post_only,
+            "filled_shares": result.get("filled_shares"), "avg_price": result.get("avg_price"),
+            "cost": result.get("cost"), "unfilled": result.get("unfilled"),
+            "residual_risk": bool(result.get("residual_risk")),
+            "audited": True, "detail": result.get("detail", "")}
 
 
 def get_order(client, order_id: str) -> dict:
-    response = client.get_order(str(order_id))
+    response = clob_client.get_order(client, order_id)
     return {"ok": True, "response_summary": _summarize_order(response), "raw": response}
 
 
 def list_open_orders(client) -> dict:
-    response = client.get_orders() or []
+    response = clob_client.get_open_orders(client)
     rows = [{"id": row.get("id"), "asset_id": row.get("asset_id"), "side": row.get("side"),
              "price": row.get("price"), "original_size": row.get("original_size"),
              "size_matched": row.get("size_matched"), "status": row.get("status")}
@@ -443,32 +381,18 @@ def list_open_orders(client) -> dict:
 
 
 def cancel_order(client, order_id: str) -> dict:
-    """Cancel one order (the recovery direction — deliberately not gated like ``submit_order``).
+    """Cancel one order (recovery direction — deliberately not gated like ``submit_order``).
 
-    Audits itself: ``intent`` before the call, ``cancel`` after (best-effort, loud on failure),
-    so a rescue cancel is never invisible even when the caller forgets to log it.
+    Delegates to :func:`live.v2_transport.cancel_with_retry` (``cancel_orders([id])`` + retries +
+    residual-risk reporting), which also writes the ``intent``/``cancel`` audit records.
     """
-    audited = True
-    try:
-        audit({"action": "intent", "reason": "cancel_order", "params": {"order_id": str(order_id)}})
-    except AuditError as exc:
-        # recovery must always work, so an unwritable log does not block the cancel — but it
-        # is never silent either
-        audited = False
-        print(f"AUDIT FAILURE before cancel (order_id={order_id}): {exc}", file=sys.stderr)
-    response = client.cancel(str(order_id))
-    summary = _summarize_cancel(response)
-    canceled = [str(x) for x in (summary.get("canceled") or summary.get("cancelled") or [])]
-    ok = str(order_id) in canceled
-    try:
-        audit({"action": "cancel", "reason": "ok" if ok else "cancel_not_confirmed",
-               "params": {"order_id": str(order_id)}, "response_summary": summary,
-               "order_id": str(order_id)})
-    except AuditError as exc:  # the cancel already happened: surface it loudly, do not hide it
-        audited = False
-        print(f"AUDIT FAILURE after cancel (order_id={order_id}): {exc}", file=sys.stderr)
-    return {"ok": ok, "order_id": str(order_id), "canceled": canceled,
-            "response_summary": summary, "audited": audited, "raw": response}
+    from . import v2_transport  # local import: v2_transport imports this module
+    result = v2_transport.cancel_with_retry(client, str(order_id))
+    summary = result.get("response_summary") or {"attempts": result.get("attempts")}
+    return {"ok": bool(result.get("ok")), "order_id": str(order_id),
+            "canceled": result.get("canceled") or [], "response_summary": summary,
+            "residual_risk": bool(result.get("residual_risk")),
+            "audited": bool(result.get("audited", True)), "raw": result}
 
 
 # --------------------------------------------------------------------------- CLI
@@ -479,6 +403,7 @@ def prepare_network(env: dict) -> None:
     This box has no IPv6 route and needs the proxy from ``.env``; PyPI clients read both
     from the process environment, so they must be set before the client is constructed.
     """
+    from . import sign_dryrun  # lazy: sign_dryrun imports v2_transport which imports this module
     sign_dryrun._apply_proxy_env(env)
     clob_client.force_ipv4()
 
@@ -486,6 +411,7 @@ def prepare_network(env: dict) -> None:
 def _load_client(env: dict):
     prepare_network(env)
     credentials = creds_mod.validate_creds(env)
+    from . import sign_dryrun  # lazy (see above)
     return sign_dryrun._build_client(credentials)
 
 

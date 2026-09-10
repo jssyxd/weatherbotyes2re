@@ -22,15 +22,33 @@
 （`reversal_strategy.py`、`consensus_tracker.py`、`sleeve_signal.py`、`equity_valuation.py`、
 `research/*`、`market_adapter.py`）**零改动**。
 
-**第三方依赖（两个，都在仓库外的独立 venv；本仓库仍是 stdlib-only，不加 requirements.txt）**：
-`py-clob-client`（v1，Phase 1/2/3 与冒烟单）在 `~/桌面/poly-yes2/live-probe/.venv`；
-`py-clob-client-v2`（Phase 3b 真实通道）在 `~/桌面/poly-yes2/live-probe-v2/.venv`。
-**v2 SDK 只被惰性导入**：paper 路径与 stdlib 单测永不加载它。
+**第三方依赖：只有一个有效 SDK —— `py-clob-client-v2`（CLOB v2），装在仓库外的独立 venv**
+`~/桌面/poly-yes2/live-probe-v2/.venv`（my155 上为 `/root/live-probe-v2/.venv`）。
+本仓库仍是 stdlib-only（不加 requirements.txt），且 **v2 SDK 只被惰性导入**：paper 路径与
+stdlib 单测永不加载它。
+
+> ⚠ **v1 已废弃**：`py-clob-client`（v1，`import py_clob_client`）自 **2026-04-28** 起被 Polymarket 归档，
+> **所有 v1 签名订单都会被拒**（`invalid order version`）。Phase 3b-3 起 `live/` 下**不再有任何 v1 import**；
+> 旧 venv `~/桌面/poly-yes2/live-probe/.venv` 只保留给历史脚本，**不再被本层使用**。
+
+### 各工具使用的 SDK（Phase 3b-3 后）
+
+| 工具 | 作用 | SDK / 通道 | 网络 |
+|------|------|-----------|------|
+| `live/clob_client.py` | 共享 v2 门面：建 client（显式 ApiCreds）、余额/授权、挂单、`get_order`/`get_trades`、IPv4/代理/data-api 辅助 | **v2**（读）；写操作**委托** `v2_transport` | 只读调用 |
+| `live/v2_transport.py` | **唯一**下单/撤单实现：三重闸门 + 夹价 + 成交对账 + 撤单重试 + 审计 | **v2** | 读 + 受控写 |
+| `live/reconcile.py` | 只读对账（余额/授权/挂单/持仓/出口/风控预判） | **v2**（经 `clob_client`） | 只读 |
+| `live/port.py` | 执行端口：`PaperPort` / `LivePort`（后者调 `v2_transport`） | v2（live 侧） | 引擎路径 |
+| `live/sign_dryrun.py` | 干跑签名（本地 EIP-712，不提交） | **v2**（哨兵名单取自 `v2_transport`） | 只读（`--scenario` 零网络） |
+| `live/smoke.py` | 冒烟单编排（操作者手动触发） | **v2**（经 `submit`→`v2_transport`） | 只读 + 受控写 |
+| `live/submit.py` | 安全机制本体（闸门/审计/限额/被动性）+ v1 时代 CLI 适配器 | **v2**（写操作委托 `v2_transport`） | 只读 + 受控写 |
+| `live/order_plan.py` / `live/risk_gate.py` / `live/creds.py` | 纯函数/凭据校验 | 无 SDK | 零网络 |
 
 ## 运行方式
 
-第三方依赖只有一个 `py-clob-client`，且**只存在于独立 venv**
-`/home/da/桌面/poly-yes2/live-probe/.venv`（本仓库仍是 stdlib-only，不加 requirements.txt）。
+真实链路（reconcile / smoke / 干跑 / 提交）需要 **CLOB v2** SDK，它**只存在于独立 venv**
+`/home/da/桌面/poly-yes2/live-probe-v2/.venv`（my155: `/root/live-probe-v2/.venv`）；本仓库仍是 stdlib-only。
+stdlib 解释器下，只读工具会以"py-clob-client-v2 is not importable …"明确报错并 exit 2（fail-closed）。
 
 ```bash
 cd /home/da/桌面/poly-yes2/weatherbotyes2re

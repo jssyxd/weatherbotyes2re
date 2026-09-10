@@ -1,5 +1,33 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-10 — Phase 3b-3: live 层剩余工具统一迁到 CLOB v2（v1 全废弃）
+
+- **背景**：Phase 3b 只把新的 `v2_transport` 迁到 `py-clob-client-v2`，旧工具仍 `import py_clob_client`（v1）
+  ⇒ 在只有 v2 venv 的 my155 上 `live/reconcile.py` 直接 `No module named 'py_clob_client'`（exit=2），
+  且对已迁移的 CLOB 后端已无意义。
+- `live/clob_client.py` → **v2 门面**：`build_client`（显式 `ApiCreds`，v2 无 `create_or_derive_api_creds`）、
+  `get_balance_allowance`、`get_open_orders`、`get_order`、`get_trades`、`force_ipv4`/`http_json`/
+  `fetch_positions`/`fetch_egress_info`、`sdk_available()`；写操作 **委托** `submit_order`/`cancel_orders`
+  到 `v2_transport`（**不产生第二份实现**，全包仍只有一个 `post_order` 调用点）。惰性导入 + v2 venv 提示。
+- `live/reconcile.py` **恢复可用**（只读硬保证不变：AST 断言其零写调用，仍只用
+  `build_client`/`get_balance_allowance`/`get_open_orders`/`fetch_positions`/`force_ipv4`）。
+- `live/submit.py`：保留**安全机制本体**（三重闸门/审计/限额/被动性/CLI），写操作改为**适配器**委托
+  `v2_transport.execute_leg` / `cancel_with_retry`；`RELEASE_WRITE_METHODS` 改为 v2 名单
+  (`post_order`/`cancel_orders`)；取消单参 `cancel_order`。
+- `live/sign_dryrun.py`：哨兵名单与安装**取自 `v2_transport`**（单一来源，v1 名单删除）；签名改用 v2
+  `create_order`，`--scenario` 走 v2 本地 `OrderBuilder`（零网络）；order hash 用 v2
+  `ExchangeOrderBuilderV2`（EIP-712 域为 `exchange_v2`/`neg_risk_exchange_v2`）；产物**仍不落盘 signature**。
+- `live/v2_transport.py`：哨兵工厂与名单成为唯一来源；`take_down_unfilled` 参数（引擎路径默认 True = 立即撤余量；
+  冒烟路径 False = 让单子挂着以验证 place→query→cancel 闭环）；撤单审计改为 best-effort（恢复方向不被日志阻塞）
+  并在结果里回报 `audited`；`_book_from_summary` 兼容 v2 的 **dict** 盘口返回（v2 `get_order_book` 返回 dict）。
+- 兼容性修正：`live/*.py` 脚本模式（`python3.13 live/xxx.py`）设置 `__package__ = "live"`，使惰性相对导入可用。
+- 测试：`tests_live.py` 47/47、`tests_port.py` 16/16（stdlib 与 v2 venv 各一遍）；静态守卫更新为
+  "全包恰一处 `post_order`（v2）、零 `cancel()`、`create_order` 仅 `v2_transport`/`sign_dryrun`"，
+  覆盖面测试改为枚举 **v2** `dir(ClobClient)`（24 个写方法 + 3 条白名单理由）。
+- 验证：v2 venv 下 `reconcile.py` / `smoke.py --readonly-preflight` / `sign_dryrun.py --scenario` /
+  `submit.py --open-orders` / `v2_transport.py --version|--open-orders` 全部 exit 0（`clob server version: 2`、
+  `open orders: 0`）；stdlib 下只读工具以明确提示 fail-closed（exit 2）；paper 回归 5 套件逐行 diff 为空。
+
 ## 2026-09-10 — Phase 3b-2: 部署基建 — 同一份 config 跑 paper/live 两个实例 (`_r_state.py`)
 
 - `_r_state.load_config(path, *, env=None)` 支持**三个**环境变量覆盖（`env=None` ⇒ `os.environ`）：
