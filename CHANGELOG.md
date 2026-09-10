@@ -1,5 +1,24 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-10 — Phase 3b-2: 部署基建 — 同一份 config 跑 paper/live 两个实例 (`_r_state.py`)
+
+- `_r_state.load_config(path, *, env=None)` 支持**三个**环境变量覆盖（`env=None` ⇒ `os.environ`）：
+  `YES2RE_MODE=paper|live` → `cfg['mode']`；`YES2RE_FIRE_BUDGET_USDC=<正数>` → `cfg['fire_budget_usdc']`；
+  `YES2RE_MAX_OPEN_POSITIONS=<正整数>` → `cfg['max_open_positions']`。**只**这三个，意在让 my155 的
+  paper 与 live 实例共用**同一份** `config/yes2re_reversal.json`，杜绝复制配置文件造成策略漂移。
+- 语义：① 未设置/空串 ⇒ 不覆盖，输出与改动前**逐字段一致**（`tests_port.py` 用改动前 golden 全量比对）；
+  ② 非法值（非数字/≤0/`NaN`/`inf`/非正整数/非法 mode）⇒ `SystemExit` 并**报出变量名**，fail-closed 不静默忽略；
+  ③ 覆盖发生在 `_validate_config` **之前**，间隔/金额/模式校验对生效后的配置照常执行；
+  ④ 新增 `_env_overrides()`（纯函数、可注入 env）与 `ENV_*` 常量；选中非 paper 时 stderr 打 WARNING。
+- **安全锁保留并细化**：config **文件**仍然无法把 `mode` 选成 live（`_validate_config(..., mode_opt_in=False)`
+  默认不变，`mode: live` 的文件照旧被拒）；只有**显式** `YES2RE_MODE=live` 才能选中，且首选还需执行端口的三重闸门
+  （`tests_port.py` 断言"仅 mode=live、无闸门"→ `PortRefused(submit_flag_missing)`，不开仓、不降级）。
+- 文档：`live/README.md` 新增"同一份 config 跑两个实例：三个 env 覆盖"小节；`DEPLOY_RUNBOOK.md` §7.2/§7.3.1
+  更新 systemd 单元（三个 `Environment=` 行）并警示**不要把 `.env` 当 `EnvironmentFile`**（其中历史遗留的
+  `YES2RE_MODE=live` 若被导出会让 paper 实例被环境选中 live）。
+- 回归：`tests_reversal` / `tests_fill_gate` / `tests_sleeve_signal` / `tests_sleeve_wiring` /
+  `paper_reversal_sim --scenarios-only` 五套件对基线**逐行 diff 为空**；`tests_port.py` 16/16、`tests_live.py` 47/47。
+
 ## 2026-09-10 — LIVE 执行层 Phase 3b: 执行端口(port)化 + CLOB **v2** 迁移 (`live/port.py`, `live/v2_transport.py`)
 
 - **端口模型（操作者最高优先级：live 与 paper 同策略/同逻辑/同基建）**：`_r_cycle._paper_fire` 的

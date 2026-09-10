@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -93,10 +94,62 @@ def _decode(obj: Any) -> Any:
     return obj
 
 
-def load_config(path: str | os.PathLike) -> dict[str, Any]:
+#: deployment overrides (only these three; see ``_env_overrides``)
+ENV_MODE = "YES2RE_MODE"
+ENV_FIRE_BUDGET = "YES2RE_FIRE_BUDGET_USDC"
+ENV_MAX_OPEN = "YES2RE_MAX_OPEN_POSITIONS"
+ENV_OVERRIDE_KEYS = (ENV_MODE, ENV_FIRE_BUDGET, ENV_MAX_OPEN)
+_VALID_MODES = ("paper", "live")
+
+
+def _env_overrides(env: dict[str, str] | None = None) -> dict[str, Any]:
+    """Read the three deployment env overrides.
+
+    Rationale: the live and paper instances share **one** config file (so strategy
+    parameters can never drift apart); only the mode and the two hard caps may be
+    selected per instance, and only through the environment.
+
+    Absent/empty ⇒ not applied (behaviour identical to no override at all).
+    Illegal ⇒ ``SystemExit`` naming the variable (fail closed, never silently ignored).
+    """
+    src = os.environ if env is None else env
+    applied: dict[str, Any] = {}
+    raw_mode = src.get(ENV_MODE)
+    if raw_mode is not None and str(raw_mode).strip() != "":
+        mode = str(raw_mode).strip().lower()
+        if mode not in _VALID_MODES:
+            raise SystemExit(f"env {ENV_MODE}={raw_mode!r}: bad mode (want {'|'.join(_VALID_MODES)})")
+        applied["mode"] = mode
+    raw_budget = src.get(ENV_FIRE_BUDGET)
+    if raw_budget is not None and str(raw_budget).strip() != "":
+        try:
+            budget = float(str(raw_budget).strip())
+        except (TypeError, ValueError):
+            raise SystemExit(f"env {ENV_FIRE_BUDGET}={raw_budget!r}: not a number") from None
+        if not math.isfinite(budget) or budget <= 0:
+            raise SystemExit(f"env {ENV_FIRE_BUDGET}={raw_budget!r}: must be a finite positive number")
+        applied["fire_budget_usdc"] = budget
+    raw_max = src.get(ENV_MAX_OPEN)
+    if raw_max is not None and str(raw_max).strip() != "":
+        text = str(raw_max).strip()
+        if not text.lstrip("+").isdigit() or int(text) <= 0:
+            raise SystemExit(f"env {ENV_MAX_OPEN}={raw_max!r}: must be a positive integer")
+        applied["max_open_positions"] = int(text)
+    return {"applied": applied, "mode_explicit": "mode" in applied,
+            "keys": [k for k in ENV_OVERRIDE_KEYS if k in src and str(src.get(k) or "").strip() != ""]}
+
+
+def load_config(path: str | os.PathLike, *, env: dict[str, str] | None = None) -> dict[str, Any]:
     """Read + validate a single run-config JSON, merging missing keys with
     :data:`DEFAULTS`. The ``strategy`` sub-dict is merged shallowly with the
-    strategy module defaults at call time (see ``reversal_strategy``)."""
+    strategy module defaults at call time (see ``reversal_strategy``).
+
+    Deployment overrides come from the environment (``env=None`` ⇒ ``os.environ``):
+    only ``mode`` / ``fire_budget_usdc`` / ``max_open_positions`` can differ between the
+    paper and live instances — every strategy parameter stays exactly as the shared
+    config file says. Without those variables the returned dict is bit-for-bit what it
+    always was.
+    """
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
     p = Path(path)
     if p.exists():
@@ -107,16 +160,31 @@ def load_config(path: str | os.PathLike) -> dict[str, Any]:
         if isinstance(user.get("strategy"), dict):
             strat.update(_decode(user["strategy"]))
         cfg["strategy"] = strat
-    _validate_config(cfg, p)
+    overrides = _env_overrides(env)
+    cfg.update(overrides["applied"])
+    _validate_config(cfg, p, mode_opt_in=overrides["mode_explicit"])
+    if overrides["applied"].get("mode") not in (None, "paper"):
+        print(f"WARNING: {ENV_MODE}={overrides['applied']['mode']} selected by the environment "
+              f"(overrides the shared config); live writes still require the execution-port gates",
+              file=sys.stderr)
     # Default active universe: whole registry unless restricted.
     cfg.setdefault("active_icaos", None)
     return cfg
 
 
-def _validate_config(cfg: dict[str, Any], source: Path) -> None:
+def _validate_config(cfg: dict[str, Any], source: Path, *, mode_opt_in: bool = False) -> None:
+    """Validate the *effective* config (after env overrides).
+
+    ``mode_opt_in`` is True only when the mode came from ``YES2RE_MODE``: a config **file**
+    can still never select a non-paper mode (that was and remains the safety lock), while
+    the operator may opt in explicitly per process.
+    """
     mode = str(cfg.get("mode", "paper")).lower()
-    if mode != "paper":
-        raise SystemExit(f"refusing non-paper mode {mode!r}: safety lock (paper only)")
+    if mode not in _VALID_MODES:
+        raise SystemExit(f"config {source}: bad mode {mode!r} (want {'|'.join(_VALID_MODES)})")
+    if mode != "paper" and not mode_opt_in:
+        raise SystemExit(f"refusing non-paper mode {mode!r}: safety lock (paper only); "
+                         f"set {ENV_MODE}={mode} to opt in explicitly")
     intervs = [
         "scan_interval_seconds",
         "fast_poll_interval_seconds",

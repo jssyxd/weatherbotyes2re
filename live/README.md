@@ -335,6 +335,29 @@ $V2 live/v2_transport.py --version       # clob server version: 2（只读）
 $V2 live/v2_transport.py --open-orders   # 只读：当前挂单
 ```
 
+### 同一份 config 跑两个实例：三个 env 覆盖（Phase 3b-2）
+
+paper 与 live 实例**共用同一个** `config/yes2re_reversal.json`，避免复制配置文件导致**策略漂移**。
+只有下面三个变量可以用环境变量区分实例，其余（全部策略参数：窗口/共识/sleeve/腿比例/上限语义…）
+**完全相同**，且**只读**取自那份 config：
+
+| 环境变量 | 覆盖 `cfg[...]` | 取值 | 非法值 |
+|---|---|---|---|
+| `YES2RE_MODE` | `mode` | `paper` \| `live`（大小写/空白已归一） | 其它值 → `SystemExit`（明确报出变量名） |
+| `YES2RE_FIRE_BUDGET_USDC` | `fire_budget_usdc` | 有限正数（支持 `12`、`7.5`、`1e1`） | 非数字/≤0/`NaN`/`inf` → `SystemExit` |
+| `YES2RE_MAX_OPEN_POSITIONS` | `max_open_positions` | 正整数 | `0`/负数/小数/非数字 → `SystemExit` |
+
+规则（与 `_r_state.load_config` 实现一致）：
+
+- **未设置（或空串）＝不覆盖**：输出与改动前**逐字段一致**（`tests_port.py` 用改动前的 golden 全量比对）。
+- **非法值 → fail-closed 抛错**，绝不静默忽略（宁可启动失败，不要跑错额度）。
+- 覆盖发生在 `_validate_config` **之前**，校验对**生效后的**配置照常执行（间隔/金额/模式检查都还在）。
+- **安全锁保留**：**config 文件本身**永远不能把 `mode` 选成 live（`mode: live` 的文件仍被拒）；
+  只有**显式**的 `YES2RE_MODE=live` 才能选中 live，且选中时会在 stderr 打一行 WARNING（journal 可见）。
+  真正下单还需执行端口的三重闸门（下表），所以"mode=live 但缺闸门"仍是不开仓。
+- 部署提示：**不要把 `.env` 当 `EnvironmentFile`**（本仓库 `.env` 里有历史遗留的 `YES2RE_MODE=live`），
+  否则 paper 实例可能被环境选中 live。单元里用显式 `Environment=` 行（见 `DEPLOY_RUNBOOK.md` §7）。
+
 ### 三重闸门（服务侧版本）
 
 引擎不是 CLI 工具，所以三个闸门换成**环境变量**（全部**刻意不写进 `.env`**）；缺任何一个：

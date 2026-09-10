@@ -89,8 +89,11 @@ jq . data/yes2re_health.json
 ### 7.2 切 live 的闸门（三者缺一：`fire_port_refused` 事件，不开仓，**不会降级成 paper**）
 
 ```bash
-# ① 引擎模式（config 由操作者改，仓库内不预置）
-#    config/yes2re_reversal.json → "mode": "live"      ← 唯一允许的配置改动
+# ① 引擎模式 —— **不要**改 config 文件（两个实例共用同一份，防止策略漂移）
+#    用环境变量：YES2RE_MODE=live        （config 文件本身永远无法选中 live，安全锁保留）
+#    两个实例的额度也用 env 区分（策略参数完全相同）：
+#      YES2RE_FIRE_BUDGET_USDC=<正数>        override cfg['fire_budget_usdc']
+#      YES2RE_MAX_OPEN_POSITIONS=<正整数>     override cfg['max_open_positions']
 # ② 服务侧三闸门（写进 systemd 单元，绝不写进 .env）
 #    Environment=YES2RE_LIVE_ENABLE_SUBMIT=1
 #    Environment=LIVE_SUBMIT_ENABLED=1
@@ -116,6 +119,12 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/weatherbotyes2re
 EnvironmentFile=/root/weatherbotyes2re/.env
+# ⚠ 不要把 YES2RE_MODE / 额度这类“实例选择”变量放进 .env：paper 与 live 共用同一份 config，
+#   模式与额度只由单元里的显式 Environment= 行给（.env 内历史遗留的 YES2RE_MODE=live 若被导出，
+#   paper 实例会被环境选中 live）。三个 override 变量与合法性见 live/README.md。
+Environment=YES2RE_MODE=live
+Environment=YES2RE_FIRE_BUDGET_USDC=12
+Environment=YES2RE_MAX_OPEN_POSITIONS=10
 Environment=YES2RE_LIVE_ENABLE_SUBMIT=1
 Environment=LIVE_SUBMIT_ENABLED=1
 Environment=YES2RE_LIVE_CONFIRM=SMOKE-CHANGE_ME_DAILY
@@ -128,6 +137,17 @@ WantedBy=multi-user.target
 ```
 > 注意：`reversal_runner.py` 入口当前硬拒非 paper 模式（Phase 3 的安全约束）；切 live 前需操作者
 > 明确解除该入口限制（本仓库未改）。`live/port.py` 已按 `cfg["mode"]` 就绪。
+
+### 7.3.1 两个实例的差异面（只有这三个）
+
+| 变量 | 覆盖 | 说明 |
+|------|------|------|
+| `YES2RE_MODE` | `cfg['mode']` | `paper` \| `live`；非法值 → 启动即 `SystemExit`（fail-closed，不静默忽略） |
+| `YES2RE_FIRE_BUDGET_USDC` | `cfg['fire_budget_usdc']` | 每笔 fire 预算；有限正数 |
+| `YES2RE_MAX_OPEN_POSITIONS` | `cfg['max_open_positions']` | 同时持仓上限；正整数 |
+
+未设置时 `load_config` 输出与改动前逐字段一致；覆盖后 `_validate_config`（间隔/金额/模式）照常校验。
+策略参数（`strategy` 子字典）**永远**来自共用的 config 文件，环境变量无法触及。
 
 ### 7.4 观测镜像（复用**同一套**观察脚本与 cron）
 

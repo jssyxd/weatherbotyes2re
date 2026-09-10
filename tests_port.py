@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 import _r_cycle  # noqa: E402  (must import cleanly without py-clob-client-v2)
+import _r_state  # noqa: E402
 import re_execution  # noqa: E402
 from live import port as port_mod  # noqa: E402
 from live import submit, v2_transport  # noqa: E402
@@ -663,6 +664,233 @@ def test_v2_sentinels_least_privilege():
         raise AssertionError("arming without post_order must fail closed")
 
 
+# --------------------------------------------------- Phase 3b-2: deployment env overrides
+
+#: ``_r_state.load_config("config/yes2re_reversal.json")`` captured BEFORE the env-override
+#: change (HEAD 69743da) — the no-override path must stay bit-for-bit identical to this.
+GOLDEN_CONFIG = json.loads(r"""
+{
+ "active_icaos": null,
+ "arm_book_interval_seconds": 8,
+ "arm_metar_interval_seconds": 5,
+ "base_fee_rate": "0.02",
+ "checkwx_api_key_env": "CHECKWX_API_KEY",
+ "contract_cities_path": "config/contract_cities.json",
+ "fast_poll_interval_seconds": 5,
+ "fire_budget_usdc": 20.0,
+ "health_path": "data/yes2re_health.json",
+ "idle_book_interval_seconds": 30,
+ "idle_metar_interval_seconds": 30,
+ "log_path": "data/yes2re_events.jsonl",
+ "max_open_positions": 12,
+ "mode": "paper",
+ "paper_initial_capital_usdc": 600.0,
+ "rules_refresh_interval_seconds": 1200,
+ "scan_interval_seconds": 20,
+ "settle_grace_hours": 2,
+ "settle_max_hours": 72,
+ "settle_poll_seconds": 60,
+ "state_path": "data/yes2re_state.json",
+ "strategy": {
+  "allow_market_consensus_reference": true,
+  "allow_market_ref_fire": true,
+  "arm_c": 1.0,
+  "break_confirm_margin_f": 1.0,
+  "consensus_min_lead": "0.03",
+  "consensus_min_samples": 8,
+  "consensus_window_seconds": 3600,
+  "fast_poll_seconds": 8,
+  "fire_budget_ms": 8000,
+  "high_fire_local_hour_end": 18,
+  "high_fire_local_start": 12,
+  "low_fire_local_end": 9,
+  "low_fire_local_start": 0,
+  "max_bucket_jump": 1,
+  "max_obs_future_seconds": 900,
+  "max_obs_lookback_seconds": 5400,
+  "no_max_ask": "1.0",
+  "no_notional_pct": 0.25,
+  "require_consensus_filter": true,
+  "require_fresh_obs_seconds": 180,
+  "sleeve_enabled": false,
+  "sleeve_long_window_s": 600,
+  "sleeve_max_ask": 0.35,
+  "sleeve_min_ticks": 4,
+  "sleeve_neighbour_rise": 0.04,
+  "sleeve_notional_pct": 0.08,
+  "sleeve_rank1_drop": 0.05,
+  "sleeve_short_window_s": 150,
+  "sleeve_timeout_s": 1800,
+  "yes_leg_enabled": true,
+  "yes_max_ask": "0.9",
+  "yes_min_ask": "0.48",
+  "yes_notional_pct": 0.75
+ },
+ "taf_refresh_interval_seconds": 1800,
+ "tail_hours": 144,
+ "ws_triggered_metar_enabled": true
+}
+""")
+
+GOLDEN_STRATEGY = json.loads(r"""
+{
+ "allow_market_consensus_reference": true,
+ "allow_market_ref_fire": true,
+ "arm_c": 1.0,
+ "break_confirm_margin_f": 1.0,
+ "consensus_min_lead": "0.03",
+ "consensus_min_samples": 8,
+ "consensus_window_seconds": 3600,
+ "fast_poll_seconds": 8,
+ "fire_budget_ms": 8000,
+ "high_fire_local_hour_end": 18,
+ "high_fire_local_start": 12,
+ "low_fire_local_end": 9,
+ "low_fire_local_start": 0,
+ "max_bucket_jump": 1,
+ "max_obs_future_seconds": 900,
+ "max_obs_lookback_seconds": 5400,
+ "no_max_ask": "1.0",
+ "no_notional_pct": 0.25,
+ "require_consensus_filter": true,
+ "require_fresh_obs_seconds": 180,
+ "sleeve_enabled": false,
+ "sleeve_long_window_s": 600,
+ "sleeve_max_ask": 0.35,
+ "sleeve_min_ticks": 4,
+ "sleeve_neighbour_rise": 0.04,
+ "sleeve_notional_pct": 0.08,
+ "sleeve_rank1_drop": 0.05,
+ "sleeve_short_window_s": 150,
+ "sleeve_timeout_s": 1800,
+ "yes_leg_enabled": true,
+ "yes_max_ask": "0.9",
+ "yes_min_ask": "0.48",
+ "yes_notional_pct": 0.75
+}
+""")
+
+
+def test_load_config_env_overrides():
+    """The three deployment overrides work, fail closed, and never touch strategy params."""
+    import os
+    from unittest import mock
+
+    baseline = _r_state.load_config("config/yes2re_reversal.json")
+    assert baseline == GOLDEN_CONFIG, "no-env load_config changed vs the pre-change baseline"
+    assert baseline["mode"] == "paper" and baseline["fire_budget_usdc"] == 20.0
+    assert baseline["max_open_positions"] == 12
+    assert baseline["strategy"] == GOLDEN_STRATEGY
+
+    # (1) each override lands exactly, and only on its own key
+    cases = [
+        ({"YES2RE_MODE": "live"}, {"mode": "live"}),
+        ({"YES2RE_MODE": "paper"}, {"mode": "paper"}),
+        ({"YES2RE_MODE": " LIVE "}, {"mode": "live"}),          # trimmed + lower-cased
+        ({"YES2RE_FIRE_BUDGET_USDC": "7.5"}, {"fire_budget_usdc": 7.5}),
+        ({"YES2RE_FIRE_BUDGET_USDC": "1e1"}, {"fire_budget_usdc": 10.0}),
+        ({"YES2RE_MAX_OPEN_POSITIONS": "3"}, {"max_open_positions": 3}),
+        ({"YES2RE_MAX_OPEN_POSITIONS": "+4"}, {"max_open_positions": 4}),
+        ({"YES2RE_MODE": "live", "YES2RE_FIRE_BUDGET_USDC": "12", "YES2RE_MAX_OPEN_POSITIONS": "10"},
+         {"mode": "live", "fire_budget_usdc": 12.0, "max_open_positions": 10}),
+    ]
+    for env, expected in cases:
+        with contextlib.redirect_stderr(io.StringIO()):
+            cfg = _r_state.load_config("config/yes2re_reversal.json", env=env)
+        for key, value in expected.items():
+            assert cfg[key] == value, (env, key, cfg[key], value)
+        untouched = [k for k in GOLDEN_CONFIG if k not in expected]
+        assert all(cfg[k] == GOLDEN_CONFIG[k] for k in untouched), (env, "override leaked")
+        assert cfg["strategy"] == GOLDEN_STRATEGY, (env, "strategy parameters must never move")
+
+    # (2) empty/absent values are ignored (not an override, not an error)
+    for env in ({}, {"YES2RE_MODE": ""}, {"YES2RE_MODE": "   "},
+                {"YES2RE_FIRE_BUDGET_USDC": ""}, {"YES2RE_MAX_OPEN_POSITIONS": ""}):
+        assert _r_state.load_config("config/yes2re_reversal.json", env=env) == GOLDEN_CONFIG, env
+
+    # (3) illegal values fail closed with a message naming the variable
+    bad = [
+        ({"YES2RE_MODE": "warp"}, "YES2RE_MODE"),
+        ({"YES2RE_MODE": "true"}, "YES2RE_MODE"),
+        ({"YES2RE_FIRE_BUDGET_USDC": "abc"}, "YES2RE_FIRE_BUDGET_USDC"),
+        ({"YES2RE_FIRE_BUDGET_USDC": "-1"}, "YES2RE_FIRE_BUDGET_USDC"),
+        ({"YES2RE_FIRE_BUDGET_USDC": "0"}, "YES2RE_FIRE_BUDGET_USDC"),
+        ({"YES2RE_FIRE_BUDGET_USDC": "NaN"}, "YES2RE_FIRE_BUDGET_USDC"),
+        ({"YES2RE_FIRE_BUDGET_USDC": "inf"}, "YES2RE_FIRE_BUDGET_USDC"),
+        ({"YES2RE_MAX_OPEN_POSITIONS": "0"}, "YES2RE_MAX_OPEN_POSITIONS"),
+        ({"YES2RE_MAX_OPEN_POSITIONS": "-2"}, "YES2RE_MAX_OPEN_POSITIONS"),
+        ({"YES2RE_MAX_OPEN_POSITIONS": "2.5"}, "YES2RE_MAX_OPEN_POSITIONS"),
+        ({"YES2RE_MAX_OPEN_POSITIONS": "many"}, "YES2RE_MAX_OPEN_POSITIONS"),
+    ]
+    for env, key in bad:
+        try:
+            _r_state.load_config("config/yes2re_reversal.json", env=env)
+        except SystemExit as exc:
+            assert key in str(exc), (env, exc)
+        else:
+            raise AssertionError(f"{env} must fail closed")
+
+    # (4) the config *file* can still never choose a non-paper mode (safety lock intact)
+    with tempfile.TemporaryDirectory() as tmp:
+        rogue = Path(tmp) / "rogue.json"
+        rogue.write_text(json.dumps({"mode": "live"}), encoding="utf-8")
+        try:
+            _r_state.load_config(rogue)
+        except SystemExit as exc:
+            assert "safety lock" in str(exc), exc
+        else:
+            raise AssertionError("a config file must not be able to select live mode")
+        # ...but an explicit env opt-in wins over the file (documented operator override)
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert _r_state.load_config(rogue, env={"YES2RE_MODE": "live"})["mode"] == "live"
+        assert _r_state.load_config(rogue, env={"YES2RE_MODE": "paper"})["mode"] == "paper"
+    try:
+        _r_state._validate_config({"mode": "live"}, Path("x.json"))
+    except SystemExit as exc:
+        assert "safety lock" in str(exc), exc
+    else:
+        raise AssertionError("_validate_config must keep the paper-only lock by default")
+
+    # (5) the real os.environ path is what the runner uses (env=None)
+    with mock.patch.dict(os.environ, {"YES2RE_MODE": "live", "YES2RE_FIRE_BUDGET_USDC": "9",
+                                      "YES2RE_MAX_OPEN_POSITIONS": "2"}, clear=False):
+        with contextlib.redirect_stderr(io.StringIO()):
+            cfg = _r_state.load_config("config/yes2re_reversal.json")
+        assert (cfg["mode"], cfg["fire_budget_usdc"], cfg["max_open_positions"]) == ("live", 9.0, 2)
+        assert cfg["strategy"] == GOLDEN_STRATEGY
+        assert _r_state._env_overrides()["mode_explicit"] is True
+    assert _r_state.ENV_OVERRIDE_KEYS == ("YES2RE_MODE", "YES2RE_FIRE_BUDGET_USDC",
+                                          "YES2RE_MAX_OPEN_POSITIONS")
+    assert _r_state.load_config("config/yes2re_reversal.json") == GOLDEN_CONFIG, \
+        "os.environ must be back to normal after the patch"
+
+    # (6) selecting live from the environment is announced on stderr (visible in the journal)
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(captured):
+        _r_state.load_config("config/yes2re_reversal.json", env={"YES2RE_MODE": "live"})
+    assert "YES2RE_MODE=live" in captured.getvalue(), captured.getvalue()
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(captured):
+        _r_state.load_config("config/yes2re_reversal.json", env={"YES2RE_MODE": "paper"})
+    assert captured.getvalue() == "", captured.getvalue()
+
+
+def test_env_override_live_still_needs_port_gates():
+    """A live mode selected by env changes nothing about who may actually submit."""
+    port_mod.reset_cache()
+    cfg = {"mode": "live", "fire_budget_usdc": 12.0, "max_open_positions": 10}
+    env = {"YES2RE_MODE": "live"}                      # no gate variables at all
+    status = port_mod.port_status(cfg, env=env)
+    assert status["ok"] is False and status["reason"] == submit.GATE_FLAG, status
+    try:
+        port_mod.get_port(cfg, env=env)
+    except port_mod.PortRefused as exc:
+        assert exc.reason == submit.GATE_FLAG, exc.reason
+    else:
+        raise AssertionError("live mode alone must not hand out a write-capable port")
+    port_mod.reset_cache()
+
+
 # --------------------------------------------------------------------------- helper
 
 @contextlib.contextmanager
@@ -678,6 +906,8 @@ def _patched(module, **attributes):
 
 
 CHECKS = [
+    ("config: env overrides (mode/budget/max_open)", test_load_config_env_overrides),
+    ("config: live via env still needs port gates", test_env_override_live_still_needs_port_gates),
     ("port: selection matrix (no downgrade)", test_port_selection_matrix),
     ("port: missing v2 SDK ⇒ live_deps_missing (F3)", test_port_selection_matrix),
     ("paper: fire matches pre-port golden", test_paper_fire_matches_pre_port_golden),
