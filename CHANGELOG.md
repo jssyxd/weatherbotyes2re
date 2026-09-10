@@ -7,6 +7,7 @@
 - **最小权限解除哨兵**：仅放出 `post_order`、`cancel` + 4 个只读方法（`get_order`/`get_orders`/`get_trades`/`get_balance_allowance`）；RFQ 六方法、凭据管理五方法、`post_heartbeat`、`drop_notifications` **保持拦截**（单测断言）。
 - **审计**：`data/live_events.jsonl` 追加式记录每个 intent / 拒绝 / 提交 / 查询 / 撤单 / 异常（**拒绝也记录**，禁止静默跳过）；`submit.py` 自身写审计，任一到达 `post_order` 的调用都伴随审计行。
 - `live/smoke.py` — 冒烟单编排（操作者用）：选取活跃桶 → 5 USDC non-marketable 限价买单 → 轮询确认挂单 → 撤单 → 确认 cancelled → 对账回到 0 挂单。失败救援**必须有范围**（`no_scope` 守卫：无 `order_id` 且无 `token_id` 时拒绝盲扫；readonly 模式不救援），撤单匹配按**数值**比较（`"0.5"` == `"0.50"`）。
+- **首次真实运行（my155）暴露选桶缺陷**：discover 选中了一个死桶（`best_bid=None`、`best_ask=0.001`）→ `order_plan:no_book` 正确 fail-closed（exit 2、零提交）。修复：选桶必须**双边有盘口且近价**（`best_bid>0` 且 `0<best_ask<1` 且 ask 侧可成交量 ≥ `min_order_size`），合格桶中以 `|best_ask-0.5|` 最小者优先（并列取成交量高者）；无合格桶 → `no_tradeable_bucket` 并**逐条列出被拒候选及原因**（不允许静默跳过）。Delta 复审 APPROVE（4 组变异验证）。
 - **独立审计**（herdr impl+audit，对抗性）：首轮 NEEDS_FIX → 修复 **F-A（HIGH：救援路径在计划未生成时可盲撤账户全部挂单）** / F-C（字符串价格比较致精确撤单静默失效）/ F-B（参考价 NaN 抛异常而非 fail-closed）/ F-D（提交通道自身不写审计）→ **Delta 复审 APPROVE**（4 项全 CLOSED，6 组变异验证）。
 - **开发期间零真实订单**：`data/live_events.jsonl` 无任何 submit/cancel 动作、实时挂单 0、余额 51.713622 USDC 未变。真实冒烟单由操作者在 my155 上亲自触发（`min_order_size=5 股` 已实测）。
 

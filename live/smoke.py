@@ -253,9 +253,241 @@ def _report_skeleton(env: dict, *, budget: str, scenario: bool) -> dict:
         "scenario": scenario, "mode": str(env.get("YES2RE_MODE") or "").strip() or None,
         "budget_usdc": budget, "gates": None, "sentinel": None, "market": None, "book": None,
         "plan": None, "risk_gate": None, "limits_check": None, "non_marketable": None,
+        "selection": None, "bucket_attempts": [], "bucket_rejected": [],
         "order": {"order_id": None, "submitted": False, "confirmed": None, "cancelled": None},
         "reconcile": None, "residual_risk": False, "steps": [],
     }
+
+
+# --------------------------------------------------------------------------- bucket selection
+
+#: qualification codes for a candidate bucket (a dead/thin bucket must never be picked)
+BUCKET_OK = "ok"
+NO_BID = "no_bid"
+NO_ASK = "no_ask"
+ASK_AT_EXTREME = "ask_at_extreme"
+ASK_SIZE_BELOW_MIN = "ask_size_below_min"
+ASK_ABOVE_CAP = "ask_above_cap"
+NO_PASSIVE_PRICE = "no_passive_price"
+INVALID_BOOK = "invalid_book"
+NO_TRADEABLE_BUCKET = "no_tradeable_bucket"
+
+NEAR_MID = Decimal("0.5")
+MAX_CANDIDATE_BOOKS = 8          # bound the read-only /book fetches per session
+MAX_SELECTION_SESSIONS = 6
+
+
+def _price_or_none(value) -> Decimal | None:
+    try:
+        parsed = Decimal(str(value).strip())
+    except (InvalidOperation, AttributeError, ValueError):
+        return None
+    return parsed if parsed.is_finite() and parsed > 0 else None
+
+
+def assess_book(book, *, cap=None, tick=None, min_order_size=None) -> dict:
+    """Trader view of one book: two-sided, near-price, tradable, and cap-compatible.
+
+    Pure. A bucket qualifies only when **both** sides quote: ``best_bid > 0`` and
+    ``0 < best_ask < 1``, with at least ``min_order_size`` shares resting near the ask, and a
+    passive price we can actually place (``min(best_bid, best_ask - 2*tick) >= tick``).
+    Everything else is a recorded refusal — a dead bucket must never be silently picked.
+    """
+    out = {"ok": False, "reason": INVALID_BOOK, "detail": "", "best_bid": None, "best_ask": None,
+           "tick": None, "min_order_size": None, "ask_size_near": None,
+           "ask_distance": None, "passive_price": None, "cap": None}
+    if not isinstance(book, dict):
+        return {**out, "detail": "book: missing"}
+    raw_tick = tick if tick is not None else book.get("tick_size")
+    raw_min = min_order_size if min_order_size is not None else book.get("min_order_size")
+    try:
+        tick_value = _dec(raw_tick, "tick_size") if raw_tick else Decimal("0.01")
+        minimum = _dec(raw_min, "min_order_size")
+    except ValueError as exc:
+        return {**out, "detail": str(exc)}
+    out.update({"tick": str(tick_value), "min_order_size": str(minimum)})
+
+    bid = _price_or_none(book.get("best_bid"))
+    ask = _price_or_none(book.get("best_ask"))
+    out.update({"best_bid": None if bid is None else str(bid),
+                "best_ask": None if ask is None else str(ask)})
+    if bid is None:
+        return {**out, "reason": NO_BID,
+                "detail": f"best_bid={book.get('best_bid')!r} — one-sided/dead bucket"}
+    if ask is None:
+        return {**out, "reason": NO_ASK,
+                "detail": f"best_ask={book.get('best_ask')!r} — no resting ask"}
+    one = Decimal(1)
+    if not (Decimal(0) < ask < one):
+        return {**out, "reason": ASK_AT_EXTREME,
+                "detail": f"best_ask {ask} at an extreme (0,1) bound — dead bucket"}
+    if ask > one - tick_value * TICK_GAP:
+        # ask pinned against 1: the bucket is effectively decided and no passive BUY can rest
+        # meaningfully below it (mirror of the can't-rest-below-tiny-ask case below)
+        return {**out, "reason": ASK_AT_EXTREME,
+                "detail": f"best_ask {ask} within {TICK_GAP} ticks of 1 — dead bucket"}
+    if bid >= ask:
+        return {**out, "reason": INVALID_BOOK, "detail": f"crossed book: bid {bid} >= ask {ask}"}
+
+    near_limit = ask + tick_value * TICK_GAP
+    ask_size_near = Decimal(0)
+    for row in book.get("asks") or []:
+        try:
+            price, size = Decimal(str(row.get("price"))), Decimal(str(row.get("size")))
+        except (InvalidOperation, AttributeError, ValueError, TypeError):
+            continue
+        if price <= near_limit:
+            ask_size_near += size
+    out["ask_size_near"] = str(ask_size_near)
+    if ask_size_near < minimum:
+        return {**out, "reason": ASK_SIZE_BELOW_MIN,
+                "detail": f"near-ask size {ask_size_near} < min_order_size {minimum}"}
+    if cap is not None:
+        out["cap"] = str(cap)
+        if ask > Decimal(str(cap)):
+            return {**out, "reason": ASK_ABOVE_CAP, "detail": f"best_ask {ask} > cap {cap}"}
+
+    choice = smoke_price(book)
+    if not choice["ok"]:
+        return {**out, "reason": NO_PASSIVE_PRICE, "detail": choice["detail"]}
+    out.update({"ok": True, "reason": BUCKET_OK, "passive_price": str(choice["price"]),
+                "ask_distance": str(abs(ask - NEAR_MID)),
+                "detail": f"two-sided: bid {bid} / ask {ask}, near-ask size {ask_size_near}, "
+                          f"passive {choice['price']}"})
+    return out
+
+
+def choose_bucket(candidates: list) -> dict | None:
+    """Pick the qualifying bucket whose ``best_ask`` is closest to 0.5; ties → higher volume."""
+    qualified = [row for row in candidates if (row.get("assessment") or {}).get("ok")]
+    if not qualified:
+        return None
+    return min(qualified, key=lambda row: (row["assessment"]["ask_distance"],
+                                           -float(row.get("volume") or 0)))
+
+
+def _gamma_candidates(client, session: dict, *, cap, timeout: int) -> list[dict]:
+    """Accepting markets of one Gamma event, ordered by 'most likely live & near mid'."""
+    record = sign_dryrun._city_table().get(session["city"]) or {}
+    slug = str(record.get("market_city_slug") or session["city"])
+    event = clob_client.http_json(
+        sign_dryrun.GAMMA_EVENT_ENDPOINT + sign_dryrun._event_slug(slug, session["local_date"],
+                                                                   session["direction"]),
+        timeout=timeout,
+    )
+    rows = []
+    for market in event.get("markets") or []:
+        if not isinstance(market, dict) or not market.get("acceptingOrders"):
+            continue
+        try:
+            tokens = json.loads(market.get("clobTokenIds") or "[]")
+        except ValueError:
+            tokens = []
+        if not tokens:
+            continue
+        rows.append({"market": market, "token_id": str(tokens[0]),
+                     "volume": market.get("volumeNum"),
+                     "hint_bid": market.get("bestBid"), "hint_ask": market.get("bestAsk")})
+
+    def _rank(row: dict):
+        has_bid = 0 if _price_or_none(row["hint_bid"]) else 1     # prefer quoted two-sided
+        distance = abs((_price_or_none(row["hint_ask"]) or NEAR_MID) - NEAR_MID)
+        return (has_bid, distance, -float(row["volume"] or 0))
+
+    return sorted(rows, key=_rank)
+
+
+def select_tradeable_bucket(client, *, city=None, local_date=None, direction=None, token_id=None,
+                            cap=None, timeout: int = 25, limit=None,
+                            max_candidates: int = MAX_CANDIDATE_BOOKS,
+                            state_path=None) -> dict:
+    """Find a *tradable* bucket: two-sided, near-price, ask-side size >= min_order_size.
+
+    Read-only (Gamma + CLOB GET). Every candidate it looks at is recorded with its verdict, so
+    a refusal is auditable — never a silent skip. With no qualifying bucket the reason is
+    ``no_tradeable_bucket`` plus the rejected list.
+    """
+    attempts: list[dict] = []
+    rejected: list[dict] = []
+
+    if token_id:                                   # operator pinned a token: assess, don't choose
+        book = sign_dryrun._book_from_summary(client.get_order_book(token_id))
+        assessment = assess_book(book, cap=cap)
+        entry = {"key": f"token:{token_id}", "bucket": None, "token_id": str(token_id),
+                 "status": assessment["reason"], "detail": assessment["detail"],
+                 "best_bid": assessment["best_bid"], "best_ask": assessment["best_ask"]}
+        attempts.append(entry)
+        if not assessment["ok"]:
+            rejected.append(entry)
+            return {"ok": False, "reason": NO_TRADEABLE_BUCKET, "detail": assessment["detail"],
+                    "attempts": attempts, "rejected": rejected, "selection": None}
+        return {"ok": True, "reason": BUCKET_OK,
+                "market": {"city": city, "local_date": local_date, "direction": direction,
+                           "bucket": None, "title": "explicit --token-id", "volume": None,
+                           "token_id": str(token_id)},
+                "book": book, "attempts": attempts, "rejected": rejected,
+                "selection": {"rule": "explicit --token-id", "assessment": assessment}}
+
+    sessions = sign_dryrun.candidate_sessions(state_path, limit=limit or sign_dryrun.MAX_DISCOVERY_ATTEMPTS)
+    if direction:
+        sessions = [{**row, "direction": direction} for row in sessions]
+    if city:
+        sessions = [row for row in sessions if row["city"] == city]
+    if local_date:
+        sessions = [row for row in sessions if row["local_date"] == local_date]
+
+    for session in sessions[:MAX_SELECTION_SESSIONS]:
+        key = f"{session['city']}|{session['local_date']}|{session['direction']}"
+        try:
+            rows = _gamma_candidates(client, session, cap=cap, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001 - try the next session
+            attempts.append({"key": key, "status": f"gamma_error:{type(exc).__name__}"})
+            continue
+        if not rows:
+            attempts.append({"key": key, "status": "no_accepting_markets"})
+            continue
+
+        session_candidates: list[dict] = []
+        for row in rows[:max_candidates]:
+            entry = {"key": key, "bucket": row["market"].get("groupItemTitle"),
+                     "token_id": row["token_id"], "volume": row["volume"],
+                     "best_bid": None, "best_ask": None, "ask_size_near": None,
+                     "detail": "", "status": None}
+            try:
+                book = sign_dryrun._book_from_summary(client.get_order_book(row["token_id"]))
+            except Exception as exc:  # noqa: BLE001 - record and move on
+                attempts.append({**entry, "status": f"book_error:{type(exc).__name__}"})
+                rejected.append({**entry, "status": f"book_error:{type(exc).__name__}"})
+                continue
+            assessment = assess_book(book, cap=cap)
+            entry.update({"best_bid": assessment["best_bid"], "best_ask": assessment["best_ask"],
+                          "ask_size_near": assessment["ask_size_near"],
+                          "detail": assessment["detail"], "status": assessment["reason"]})
+            attempts.append(entry)
+            if not assessment["ok"]:
+                rejected.append(entry)
+                continue
+            session_candidates.append({
+                "volume": row["volume"], "assessment": assessment, "book": book,
+                "market": {"city": session["city"], "local_date": session["local_date"],
+                           "direction": session["direction"],
+                           "bucket": row["market"].get("groupItemTitle"),
+                           "title": row["market"].get("question"),
+                           "event_slug": None, "volume": row["volume"],
+                           "token_id": row["token_id"],
+                           "no_token_id": None},
+            })
+        chosen = choose_bucket(session_candidates)
+        if chosen is not None:
+            return {"ok": True, "reason": BUCKET_OK, "market": chosen["market"], "book": chosen["book"],
+                    "attempts": attempts, "rejected": rejected,
+                    "selection": {"rule": "min |best_ask - 0.5| among two-sided buckets (tie: volume)",
+                                  "assessed": len(session_candidates), "key": key,
+                                  "assessment": {k: v for k, v in chosen["assessment"].items() if k != "cap"}}}
+
+    return {"ok": False, "reason": NO_TRADEABLE_BUCKET,
+            "detail": f"no tradable bucket among {len(attempts)} candidate(s)",
+            "attempts": attempts, "rejected": rejected, "selection": None}
 
 
 def run_smoke(*, enable_submit: bool = False, confirm: str | None = None,
@@ -312,14 +544,30 @@ def run_smoke(*, enable_submit: bool = False, confirm: str | None = None,
         step("sentinel_armed", "ok", params={"released": sentinel["released"]},
              response_summary={"still_blocked": sentinel["still_blocked_count"]})
 
-        found = sign_dryrun.discover_market(client, city=city, local_date=local_date,
-                                            direction=direction, token_id=token_id, cap=cap,
-                                            timeout=timeout)
+        # ``direction`` here is the *market* direction (high/low), never the leg. Selection
+        # requires a two-sided, near-price bucket — dead/thin buckets are rejected loudly.
+        found = select_tradeable_bucket(client, city=city, local_date=local_date,
+                                        direction=direction, token_id=token_id, cap=cap,
+                                        timeout=timeout)
+        report["bucket_attempts"] = found["attempts"]
+        report["bucket_rejected"] = found["rejected"]
+        report["selection"] = found.get("selection")
+        if not found["ok"]:
+            report["reason"] = "bucket:no_tradeable_bucket"
+            report["exit_code"] = 2
+            step("deny", report["reason"], params={"candidates": len(found["attempts"])},
+                 response_summary={"detail": found.get("detail"),
+                                   "rejected": [{k: row.get(k) for k in
+                                                 ("key", "bucket", "best_bid", "best_ask", "status")}
+                                                for row in found["rejected"][:8]]})
+            return report
         market, book = found["market"], found["book"]
         report["market"], report["book"] = dict(market), dict(book)
         step("discover", "ok", params={"city": market.get("city"), "direction": market.get("direction")},
              response_summary={"bucket": market.get("bucket"), "best_ask": book.get("best_ask"),
-                               "best_bid": book.get("best_bid")})
+                               "best_bid": book.get("best_bid"),
+                               "passive_price": ((found.get("selection") or {}).get("assessment")
+                                                 or {}).get("passive_price")})
 
         # ① risk gate on live numbers (config fire budget — does not need the plan)
         pre = _preflight_with(reconcile_fn, env)
@@ -567,6 +815,14 @@ def human_summary(report: dict) -> str:
         lines.append(f"plan: {plan.get('side')} {plan.get('direction')} price={plan.get('price')} "
                      f"size={plan.get('size')} notional={plan.get('max_cost_usdc')} USDC "
                      f"tick={plan.get('tick')} reason={plan.get('reason')}")
+    selection = (report.get("selection") or {}).get("assessment") or {}
+    if selection.get("ok"):
+        lines.append(f"bucket: two-sided bid={selection.get('best_bid')} ask={selection.get('best_ask')} "
+                     f"near-ask size={selection.get('ask_size_near')} passive={selection.get('passive_price')}")
+    if report.get("bucket_rejected"):
+        lines.append(f"bucket rejects: {len(report['bucket_rejected'])} "
+                     + ", ".join(f"{row.get('bucket')}({row.get('status')})"
+                                 for row in report["bucket_rejected"][:6]))
     if report.get("sentinel"):
         lines.append(f"sentinel: released={report['sentinel'].get('released')} "
                      f"still_blocked={report['sentinel'].get('still_blocked_count')}")

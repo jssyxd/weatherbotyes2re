@@ -1232,23 +1232,26 @@ def _patch_smoke(client, *, market=None, book=None, resolve=None):
     """Point the smoke flow at fakes; returns a restore callable."""
     saved = {
         "build_client": sign_dryrun._build_client,
-        "discover": sign_dryrun.discover_market,
+        "select": smoke.select_tradeable_bucket,
         "audit": submit.AUDIT_PATH,
     }
     sign_dryrun._build_client = lambda creds_, **kw: client
-    sign_dryrun.discover_market = lambda *a, **kw: {
+    smoke.select_tradeable_bucket = lambda *a, **kw: {
+        "ok": True, "reason": smoke.BUCKET_OK,
         "market": market or {"city": "london", "local_date": "2026-09-11", "direction": "high",
                              "bucket": "23C", "title": "t", "token_id": "TOK-1"},
         "book": book or {"best_ask": "0.52", "best_bid": "0.50", "tick_size": "0.01",
                          "min_order_size": "5", "neg_risk": True},
-        "attempts": [],
+        "attempts": [], "rejected": [],
+        "selection": {"rule": "test", "assessment": {"ok": True, "passive_price": "0.50",
+                                                     "best_bid": "0.50", "best_ask": "0.52"}},
     }
     if resolve is not None:
         submit.check_non_marketable = resolve
 
     def restore():
         sign_dryrun._build_client = saved["build_client"]
-        sign_dryrun.discover_market = saved["discover"]
+        smoke.select_tradeable_bucket = saved["select"]
         submit.AUDIT_PATH = saved["audit"]
         if resolve is not None:
             submit.check_non_marketable = _ORIGINAL_NON_MARKETABLE
@@ -1336,21 +1339,217 @@ def test_rescue_cancel_scope_and_price_match():
     assert "get_orders" not in client3.calls, client3.calls
 
 
+# --------------------------------------------------------------------------- Phase 3: bucket selection
+
+class _FakeSummary:
+    """Stands in for OrderBookSummary (the shape sign_dryrun._book_from_summary reads)."""
+
+    def __init__(self, *, bids=(), asks=(), tick="0.01", min_size="5", neg_risk=True):
+        self.bids = [{"price": p, "size": z} for p, z in bids]
+        self.asks = [{"price": p, "size": z} for p, z in asks]
+        self.tick_size = tick
+        self.min_order_size = min_size
+        self.neg_risk = neg_risk
+
+
+def _book(bid=None, ask=None, *, tick="0.01", min_size="5", bid_size="100", ask_size="100"):
+    return {"best_bid": bid, "best_ask": ask, "tick_size": tick, "min_order_size": min_size,
+            "neg_risk": True,
+            "bids": [] if bid is None else [{"price": bid, "size": bid_size}],
+            "asks": [] if ask is None else [{"price": ask, "size": ask_size}]}
+
+
+def test_assess_book_tradability():
+    """A bucket qualifies only when it is two-sided, near-price and size-sufficient."""
+    cap = Decimal("0.9")
+    good = smoke.assess_book(_book("0.50", "0.52"), cap=cap)
+    assert good["ok"] and good["reason"] == smoke.BUCKET_OK, good
+    assert good["passive_price"] == "0.50" and good["ask_distance"] == "0.02", good
+
+    cases = [
+        (smoke.NO_BID, _book(None, "0.52")),                       # dead bucket: no bid
+        (smoke.NO_BID, _book("0", "0.52")),
+        (smoke.NO_ASK, _book("0.50", None)),                       # no resting ask
+        (smoke.NO_PASSIVE_PRICE, _book("0.001", "0.002")),         # ask 0.001 ⇒ no room to rest
+        (smoke.ASK_AT_EXTREME, _book("0.97", "0.999")),            # ask within 2 ticks of 1
+        (smoke.ASK_AT_EXTREME, _book("0.50", "1")),
+        (smoke.INVALID_BOOK, _book("0.60", "0.52")),               # crossed
+        (smoke.ASK_SIZE_BELOW_MIN, _book("0.50", "0.52", ask_size="1")),
+        (smoke.ASK_ABOVE_CAP, _book("0.94", "0.95")),              # over the config cap
+        (smoke.NO_PASSIVE_PRICE, _book("0.01", "0.02", tick="0.01")),   # min(bid, ask-2t) < tick
+        (smoke.INVALID_BOOK, {"best_bid": "0.50", "best_ask": "0.52", "tick_size": "0.01"}),  # min size missing
+        (smoke.INVALID_BOOK, None),
+    ]
+    for reason, book in cases:
+        got = smoke.assess_book(book, cap=cap)
+        assert got["ok"] is False and got["reason"] == reason, (book, got)
+        assert got["detail"], got
+
+    # near-ask depth may be spread over several levels (within 2 ticks)
+    spread = {"best_bid": "0.50", "best_ask": "0.52", "tick_size": "0.01", "min_order_size": "5",
+              "bids": [{"price": "0.50", "size": "100"}],
+              "asks": [{"price": "0.52", "size": "2"}, {"price": "0.53", "size": "4"}]}
+    assert smoke.assess_book(spread, cap=cap)["ok"] is True, smoke.assess_book(spread, cap=cap)
+    far = {**spread, "asks": [{"price": "0.52", "size": "2"}, {"price": "0.90", "size": "400"}]}
+    assert smoke.assess_book(far, cap=cap)["reason"] == smoke.ASK_SIZE_BELOW_MIN
+
+
+def test_choose_bucket_prefers_near_mid():
+    """Among qualifying buckets: |best_ask - 0.5| wins, ties break on volume."""
+    def candidate(bid, ask, volume):
+        return {"volume": volume, "assessment": smoke.assess_book(_book(bid, ask), cap=Decimal("0.9")),
+                "book": _book(bid, ask), "market": {"bucket": f"{bid}/{ask}"}}
+
+    mixed = [candidate("0.05", "0.06", 9000),      # far from mid
+             candidate("0.20", "0.21", 100),
+             candidate("0.48", "0.49", 10),        # closest to mid
+             candidate("0.50", "0.52", 5000)]
+    assert smoke.choose_bucket(mixed)["market"]["bucket"] == "0.48/0.49", smoke.choose_bucket(mixed)
+    tie = [candidate("0.48", "0.49", 10), candidate("0.50", "0.51", 5000)]   # both distance 0.01
+    assert smoke.choose_bucket(tie)["market"]["bucket"] == "0.50/0.51", smoke.choose_bucket(tie)
+    assert smoke.choose_bucket([candidate("0.001", "0.001", 1)]) is None
+
+
+def _market(bucket, token, volume, bid=None, ask=None):
+    return {"groupItemTitle": bucket, "clobTokenIds": json.dumps([token, f"{token}-no"]),
+            "volumeNum": volume, "acceptingOrders": True, "bestBid": bid, "bestAsk": ask,
+            "question": f"{bucket}?"}
+
+
+class _BucketClient:
+    """Fake transport for select_tradeable_bucket: Gamma via http_json, books per token."""
+
+    def __init__(self, books):
+        self.books = books
+        self.requested = []
+
+    def get_order_book(self, token_id):
+        self.requested.append(token_id)
+        summary = self.books.get(token_id)
+        if summary is None:
+            raise RuntimeError(f"no book for {token_id}")
+        return summary
+
+
+def _fake_state(tmp, sessions):
+    """A minimal paper-state file so candidate_sessions() never reads the real data/ state."""
+    path = Path(tmp) / "state.json"
+    path.write_text(json.dumps({"weatherbotyes2re": {"armed": {key: {} for key in sessions}}}),
+                    encoding="utf-8")
+    return path
+
+
+@contextlib.contextmanager
+def _fake_gamma(markets):
+    saved = clob_client.http_json
+    clob_client.http_json = lambda url, **kw: {"slug": "fake", "markets": markets}
+    try:
+        yield
+    finally:
+        clob_client.http_json = saved
+
+
+def test_select_tradeable_bucket_only_dead_buckets():
+    """4(a): dead buckets only ⇒ refuse with no_tradeable_bucket + the rejected list."""
+    markets = [_market("19C", "T-DEAD", 12000, bid=None, ask="0.001"),
+               _market("20C", "T-DEAD2", 9000, bid="0", ask="0.002")]
+    client = _BucketClient({"T-DEAD": _FakeSummary(bids=[], asks=[("0.001", "1000")]),
+                            "T-DEAD2": _FakeSummary(bids=[], asks=[("0.002", "1000")])})
+    with tempfile.TemporaryDirectory() as tmp, _fake_gamma(markets):
+        out = smoke.select_tradeable_bucket(client, city="amsterdam", local_date="2026-09-10",
+                                            direction="high", cap=Decimal("0.9"),
+                                            state_path=_fake_state(tmp, ["amsterdam|2026-09-10|high"]))
+    assert out["ok"] is False and out["reason"] == smoke.NO_TRADEABLE_BUCKET, out
+    assert len(out["rejected"]) == 2 and len(out["attempts"]) == 2, out["attempts"]
+    assert {row["status"] for row in out["rejected"]} == {smoke.NO_BID}, out["rejected"]
+    assert all(row["best_bid"] is None and row["bucket"] for row in out["rejected"]), out["rejected"]
+
+
+def test_select_tradeable_bucket_mixed_books():
+    """4(b): with a live bucket present, pick the one whose best_ask is closest to 0.5."""
+    markets = [_market("30C", "T-FAR", 30000, bid="0.05", ask="0.06"),
+               _market("28C", "T-MID", 100, bid="0.48", ask="0.49"),
+               _market("29C", "T-DEAD", 20000, bid=None, ask="0.001"),
+               _market("27C", "T-OTHER", 5000, bid="0.50", ask="0.52")]
+    client = _BucketClient({
+        "T-FAR": _FakeSummary(bids=[("0.05", "500")], asks=[("0.06", "500")]),
+        "T-MID": _FakeSummary(bids=[("0.48", "50")], asks=[("0.49", "50")]),
+        "T-DEAD": _FakeSummary(bids=[], asks=[("0.001", "900")]),
+        "T-OTHER": _FakeSummary(bids=[("0.50", "300")], asks=[("0.52", "300")]),
+    })
+    with tempfile.TemporaryDirectory() as tmp, _fake_gamma(markets):
+        out = smoke.select_tradeable_bucket(client, city="london", local_date="2026-09-11",
+                                            direction="high", cap=Decimal("0.9"),
+                                            state_path=_fake_state(tmp, ["london|2026-09-11|high"]))
+    assert out["ok"] is True, out
+    assert out["market"]["token_id"] == "T-MID", out["market"]
+    assert out["selection"]["assessment"]["best_ask"] == "0.49", out["selection"]
+    # passive price = min(bid 0.48, ask 0.49 - 2 ticks 0.47) = 0.47
+    assert out["selection"]["assessment"]["passive_price"] == "0.47", out["selection"]
+    statuses = {row["bucket"]: row["status"] for row in out["attempts"]}
+    assert statuses["29C"] == smoke.NO_BID and statuses["30C"] == smoke.BUCKET_OK, statuses
+    # dead bucket is recorded as rejected, never silently skipped
+    assert [row["bucket"] for row in out["rejected"]] == ["29C"], out["rejected"]
+
+    # a pinned --token-id is assessed, not chosen
+    with _fake_gamma(markets):
+        pinned = smoke.select_tradeable_bucket(client, token_id="T-FAR", cap=Decimal("0.9"))
+        pinned_dead = smoke.select_tradeable_bucket(client, token_id="T-DEAD", cap=Decimal("0.9"))
+    assert pinned["ok"] is True and pinned["market"]["token_id"] == "T-FAR", pinned
+    assert pinned_dead["ok"] is False and pinned_dead["reason"] == smoke.NO_TRADEABLE_BUCKET, pinned_dead
+
+
+def test_smoke_denies_when_no_tradeable_bucket():
+    """The flow must stop (exit 2, audited) instead of planning against a dead bucket."""
+    client = _SmokeClient()
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        with _stub_clob_types(), _audit_path(log):
+            restore = _patch_smoke(client)
+            smoke.select_tradeable_bucket = lambda *a, **kw: {
+                "ok": False, "reason": smoke.NO_TRADEABLE_BUCKET,
+                "detail": "no tradable bucket among 3 candidate(s)",
+                "attempts": [{"key": "amsterdam|2026-09-10|high", "bucket": "19C",
+                              "token_id": "T", "status": smoke.NO_BID, "best_bid": None,
+                              "best_ask": "0.001"}],
+                "rejected": [{"key": "amsterdam|2026-09-10|high", "bucket": "19C", "token_id": "T",
+                              "status": smoke.NO_BID, "best_bid": None, "best_ask": "0.001",
+                              "detail": "one-sided/dead bucket"}],
+                "selection": None,
+            }
+            try:
+                report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(), budget_usdc="5",
+                                         env=_flow_env(), sleep=lambda _s: None, attempts=1,
+                                         reconcile_fn=lambda env, **kw: _snapshot())
+            finally:
+                restore()
+        assert report["ok"] is False and report["exit_code"] == 2, report["reason"]
+        assert report["reason"] == "bucket:no_tradeable_bucket", report["reason"]
+        assert report["plan"] is None and report["order"]["submitted"] is False
+        assert [call[0] for call in client.calls] == [], client.calls
+        assert len(report["bucket_rejected"]) == 1 and report["bucket_attempts"], report
+        lines = _audit_lines(log)
+        deny = [line for line in lines if line["action"] == "deny"][-1]
+        assert deny["reason"] == "bucket:no_tradeable_bucket", deny
+        assert deny["response_summary"]["rejected"][0]["status"] == smoke.NO_BID, deny
+        assert "rejects: 1" in smoke.human_summary(report), smoke.human_summary(report)
+
+
 def test_smoke_never_blind_cancels_on_failure():
     """F-A ②/③: a failure with no scope (and the read-only mode) must not touch the order book."""
     def _explode_discover(*_a, **_k):
-        raise RuntimeError("discovery blew up before any plan existed")
+        raise RuntimeError("bucket selection blew up before any plan existed")
 
     def _forbidden_list(*_a, **_k):
         raise AssertionError("rescue listed open orders without scope — blind cancel risk")
 
-    saved = (sign_dryrun.discover_market, submit.list_open_orders)
+    saved = (smoke.select_tradeable_bucket, submit.list_open_orders)
     submit.list_open_orders = _forbidden_list
     try:
         with tempfile.TemporaryDirectory() as tmp, _stub_clob_types(), _audit_path(Path(tmp) / "l.jsonl"):
             client = _SmokeClient()
             restore = _patch_smoke(client)
-            sign_dryrun.discover_market = _explode_discover   # after the patch helper
+            smoke.select_tradeable_bucket = _explode_discover   # after the patch helper
             try:
                 report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(), budget_usdc="5",
                                          env=_flow_env(), sleep=lambda _s: None, attempts=1,
@@ -1366,7 +1565,7 @@ def test_smoke_never_blind_cancels_on_failure():
             # read-only mode: same failure, still no rescue attempt
             client2 = _SmokeClient()
             restore = _patch_smoke(client2)
-            sign_dryrun.discover_market = _explode_discover
+            smoke.select_tradeable_bucket = _explode_discover
             try:
                 report2 = smoke.run_smoke(budget_usdc="5", env=_flow_env(), readonly=True,
                                           sleep=lambda _s: None, attempts=1,
@@ -1376,7 +1575,7 @@ def test_smoke_never_blind_cancels_on_failure():
             assert report2["residual_risk"] is False and report2["exit_code"] == 2, report2
             assert [call[0] for call in client2.calls] == [], client2.calls
     finally:
-        sign_dryrun.discover_market, submit.list_open_orders = saved
+        smoke.select_tradeable_bucket, submit.list_open_orders = saved
 
 
 def test_smoke_readonly_preflight_never_writes():
@@ -1591,6 +1790,11 @@ CHECKS = [
     ("submit: audit log (incl. refusals)", test_submit_audit_log),
     ("submit: submit_order/cancel_order audit themselves", test_submit_order_audits_itself),
     ("smoke: plan construction branches", test_smoke_plan_branches),
+    ("smoke: assess_book tradability", test_assess_book_tradability),
+    ("smoke: choose_bucket prefers near-mid", test_choose_bucket_prefers_near_mid),
+    ("smoke: selection rejects dead buckets only", test_select_tradeable_bucket_only_dead_buckets),
+    ("smoke: selection picks near-mid live bucket", test_select_tradeable_bucket_mixed_books),
+    ("smoke: denies when no tradeable bucket", test_smoke_denies_when_no_tradeable_bucket),
     ("smoke: rescue scope + numeric price match", test_rescue_cancel_scope_and_price_match),
     ("smoke: never blind-cancels on failure", test_smoke_never_blind_cancels_on_failure),
     ("smoke: readonly preflight never writes", test_smoke_readonly_preflight_never_writes),
