@@ -1,5 +1,55 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-10 — LIVE 执行层 Phase 3b: 执行端口(port)化 + CLOB **v2** 迁移 (`live/port.py`, `live/v2_transport.py`)
+
+- **端口模型（操作者最高优先级：live 与 paper 同策略/同逻辑/同基建）**：`_r_cycle._paper_fire` 的
+  "成交"段改为经 `live/port.py` 的端口；策略判定/时间窗/共识过滤/sleeve/leg sizing/状态 schema/
+  事件/健康文件/结算记账**一行未动**（`_r_cycle.py` 仅 +31/−8，限于 import 与 fire 执行段）。
+  - `PaperPort`：直接调用现有 `re_execution.paper_match_fak`；`LivePort`：经 v2 传输真下单 + 成交对账。
+  - `fund()` 两模式共用 `paper_capital.reserve`（同一本账）。
+  - `get_port(cfg, env)` 按 `cfg["mode"]` 选择；**live 缺任一闸门 → `PortRefused` + `fire_port_refused`
+    事件 + 不开仓，绝不静默降级成 paper**（单测断言）。
+- **CLOB v2（2026-04-28 起 v1 订单全被拒）**：新增 `live/v2_transport.py`（由 `live/submit.py` 演进）——
+  creds 显式传入、`cancel_orders([id])`（单参 `cancel_order` 易抛 AttributeError，实测已避开）、
+  `get_open_orders()`、`SignedOrderV2` 对象取值、**提交前重取盘口并夹紧价格**（否则 post-only 被拒
+  `order crosses book`）、成交对账轮询 `get_order`/`get_trades` 取**真实成交量/均价**、
+  **撤单失败重试 3 次仍失败即标 `residual_risk`**。v2 依赖**惰性导入**（paper 路径永不需要）。
+- **安全机制全部复用而非另起**：三重闸门（服务侧换成 `YES2RE_LIVE_ENABLE_SUBMIT=1` +
+  `LIVE_SUBMIT_ENABLED=1` + `YES2RE_LIVE_CONFIRM=SMOKE-<日期>`，均不写进 `.env`）、
+  `data/live_events.jsonl` 追加式审计（含拒绝）、`check_non_marketable`/`check_limits` 同一函数对象、
+  最小权限哨兵 —— v2 全写面 **25** 个方法（order-entry 8：`create_and_post_order`/`create_and_post_market_order`/
+  `post_order`/`post_orders`/`cancel_order`/`cancel_orders`/`cancel_all`/`cancel_market_orders`；
+  credential-admin 9：`create_api_key`/`create_or_derive_api_key`/`create_builder_api_key`/`create_readonly_api_key`/
+  `delete_api_key`/`delete_readonly_api_key`/`derive_api_key`/`revoke_builder_api_key`/`update_balance_allowance`；
+  state-write 2：`post_heartbeat`/`drop_notifications`；RFQ 6：`create_rfq_request`/`cancel_rfq_request`/
+  `create_rfq_quote`/`cancel_rfq_quote`/`accept_rfq_quote`/`approve_rfq_order`），
+  仅放出 **2 个写方法** `post_order` + `cancel_orders`（其余 23 保持拦截）+ **6 个只读方法**
+  `get_order`/`get_open_orders`/`get_trades`/`get_balance_allowance`/`get_order_book`/`get_tick_size`；
+  `cancel_order`（单参 `DELETE /order`）**装哨兵但永不放出**。清单与 `live/v2_transport.py` 的
+  `SUBMIT_METHODS`/`ADMIN_METHODS`/`STATE_WRITE_METHODS`/`RFQ_SUBMIT_METHODS`/`RELEASE_*` 常量逐项一致。
+- **回归**：`tests_reversal` / `tests_fill_gate` / `tests_sleeve_signal` / `tests_sleeve_wiring` /
+  `paper_reversal_sim --scenarios-only` 五份基线**逐行 diff 为空**；`_paper_fire` 对固定输入与
+  改动前实现（`git show HEAD:_r_cycle.py`）产物**逐字段一致**（golden 值已固化进 `tests_port.py`）。
+- `tests_port.py`（新增，stdlib）：端口选择矩阵（含"缺闸门不降级"）、paper 回归、stdlib 隔离
+  （无 v2 SDK 也能 `import _r_cycle` 并拿到 PaperPort）、live 端口离线桩（部分成交/未成交/撤单失败/
+  超时/未 preflight）、v2 夹价/`execute_leg` 端到端/撤单重试/响应形状容错/哨兵最小权限。
+- 文档：`live/README.md` Phase 3b 小节 + `DEPLOY_RUNBOOK.md` §7（my155 实盘 systemd 单元镜像
+  `yes2re-paper`、观测镜像方案：复用同一套 observer/triage 与 30min cron，汇报仍含 ①开仓 ②当前权益）。
+- **开发期间零真实订单**：`data/live_events.jsonl` 无 submit/cancel 动作；v2 只读复核
+  `--version` → `clob server version: 2`、`--open-orders` → `open orders: 0`。
+- **独立审计**（herdr impl+audit）：首轮 NEEDS_FIX → 修复 **F1**（写通道只查 `gates["ok"]`，未要求三个
+  checks 全真 → 抽出 `submit.gates_all_passed()` 供 v1/v2 共用，伪造/截断的闸门记录一律拒绝）、
+  **F2**（v2 `cancel_order`（DELETE `/order`）既未装哨兵也未释放、且不在 AST denylist → 纳入
+  `SUBMIT_METHODS` 保持拦截，静态守卫覆盖 `cancel_order`，文档清单同步更正）、
+  **F3**（`live_deps_missing` 分支不可达 → `get_port` 探测 `v2_transport.sdk_available()`，缺 SDK 时
+  以该 reason 拒绝）、**F4**（README/`live/__init__.py`/`--status` hint 的过期或误导措辞更正）→ **Delta 复审 APPROVE**。
+- **增量复审收尾（文档一致性，3 项 LOW）**：`live/README.md` 开头块重写（补齐 Phase 1/2/3/3b 能力表，
+  删掉"任何阶段都不存在提交订单代码路径""paper 引擎一行未改""本包完全独立(不 import paper 模块)"
+  "第三方依赖只有一个"等过期断言；改为与实际一致的端口模型 + 两 SDK/两 venv 说明）；
+  写面清单/数量与 `live/v2_transport.py` 常量**逐项对齐**（25 / 释放 2 / 只读 6，列出每个方法名）；
+  Phase 3 小节标注为 **legacy v1 通道**（2026-04-28 起 v1 订单被拒，安全机制本体被 v2 复用）；
+  审计日志 quarantine 指针（主日志 `action=note`,`reason=debris_pointer` → `data/live_events.test_debris.jsonl`）。
+
 ## 2026-09-10 — LIVE 执行层 Phase 3: 受控真实提交通道 + 冒烟单 (`live/submit.py`, `live/smoke.py`)
 
 - `live/submit.py` — 真实提交路径，受**三重闸门**保护：CLI `--enable-submit` **且** 环境变量 `LIVE_SUBMIT_ENABLED=1` **且** `--confirm SMOKE-<UTC 日期>`（防重放短语由 `--phrase` 打印）；缺一即拒（exit 3）**并写审计**。

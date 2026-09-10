@@ -17,7 +17,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from live import clob_client, creds, order_plan, reconcile, risk_gate, sign_dryrun, smoke, submit
+from live import (clob_client, creds, order_plan, port, reconcile, risk_gate, sign_dryrun,
+                  smoke, submit, v2_transport)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -352,18 +353,24 @@ def test_reconcile_cli_json_and_exit_codes():
 #: names that must never appear as a *real call* anywhere in live/
 FORBIDDEN_CALLS = (
     "create_and_post_order", "post_order", "post_orders", "create_market_order",
-    "cancel", "cancel_orders", "cancel_all", "cancel_market_orders",
+    "cancel", "cancel_order", "cancel_orders", "cancel_all", "cancel_market_orders",
     "create_api_key", "derive_api_key", "delete_api_key", "update_balance_allowance",
     "post_heartbeat", "delete_readonly_api_key", "submit",
 )
 #: signing entry point (local only) — allowed in the phase-2 dry run and the submit channel
 SIGN_ONLY_CALLS = ("create_order",)
-#: the single controlled write channel
+#: the controlled write channels (v1 submit.py, v2 v2_transport.py) — nowhere else
 SUBMIT_MODULE = "submit.py"
-#: write calls allowed inside SUBMIT_MODULE only
-CONTROLLED_WRITE_CALLS = ("create_order", "post_order", "cancel")
+WRITE_CHANNEL_MODULES = (SUBMIT_MODULE, "v2_transport.py")
+#: write calls allowed inside those channels only
+CONTROLLED_WRITE_CALLS = ("create_order", "post_order", "cancel", "cancel_order", "cancel_orders")
+#: v2-client-only methods: inside the v2 transport they must stay pure data (never a code use);
+#: callers may only reach them through the v1 channel's module function (``submit.cancel_order``)
+V2_CLIENT_ONLY = ("cancel_order",)
+#: modules a caller may delegate a write call to (``submit.cancel_order(...)`` etc.)
+DELEGATE_MODULES = {"submit", "sign_dryrun", "v2_transport"}
 #: names that may appear in SUBMIT_MODULE only as their single call site
-CHANNEL_ONLY = ("post_order", "cancel")
+CHANNEL_ONLY = ("post_order", "cancel", "cancel_orders")
 #: module-name style uses we do not police (``submit.audit(...)`` in the orchestrator)
 NAME_USAGE_SKIP = {"submit"}
 
@@ -402,8 +409,11 @@ def test_static_no_order_path():
                     )
                     name = None
                 if name in FORBIDDEN_CALLS:
-                    assert path.name == SUBMIT_MODULE, (
-                        f"{path.name}:{node.lineno} calls {name}() — only live/{SUBMIT_MODULE} may write"
+                    delegated = (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name)
+                                 and func.value.id in DELEGATE_MODULES)
+                    assert path.name in WRITE_CHANNEL_MODULES or delegated, (
+                        f"{path.name}:{node.lineno} calls {name}() directly — only "
+                        f"{WRITE_CHANNEL_MODULES} may write (or delegate via {sorted(DELEGATE_MODULES)})"
                     )
                 if name in calls:
                     calls[name].append(f"{path.name}:{node.lineno}")
@@ -412,22 +422,27 @@ def test_static_no_order_path():
             if isinstance(node, ast.Name) and node.id in uses:
                 uses[node.id].append(f"{path.name}:{node.lineno}")
 
-    # exactly one post_order / cancel / create_order call site, all inside the channel module
-    assert len(calls["post_order"]) == 1, calls["post_order"]
-    assert calls["post_order"][0].startswith(SUBMIT_MODULE + ":"), calls["post_order"]
-    assert len(calls["cancel"]) == 1, calls["cancel"]
-    assert calls["cancel"][0].startswith(SUBMIT_MODULE + ":"), calls["cancel"]
-    assert {site.split(":")[0] for site in calls["create_order"]} == {SUBMIT_MODULE, "sign_dryrun.py"}, \
-        calls["create_order"]
-    # the channel's write calls may only appear as those call sites (never as values)
+    # exactly one order-placing call site per channel, and one cancel site per channel
+    assert sorted(site.split(":")[0] for site in calls["post_order"]) == sorted(WRITE_CHANNEL_MODULES), \
+        calls["post_order"]
+    assert {site.split(":")[0] for site in calls["cancel"]} == {SUBMIT_MODULE}, calls["cancel"]
+    assert {site.split(":")[0] for site in calls["cancel_orders"]} == {"v2_transport.py"}, calls["cancel_orders"]
+    assert {site.split(":")[0] for site in calls["create_order"]} == \
+        {SUBMIT_MODULE, "v2_transport.py", "sign_dryrun.py"}, calls["create_order"]
+    # the channels' write calls may only appear as those call sites (never as values)
     for name in CHANNEL_ONLY:
-        assert len(uses.get(name, [])) == len(calls[name]) == 1, (name, uses.get(name), calls[name])
-        assert uses[name][0].startswith(SUBMIT_MODULE + ":"), uses[name]
+        assert len(uses.get(name, [])) == len(calls[name]), (name, uses.get(name), calls[name])
+        for site in uses.get(name, []):
+            assert site.split(":")[0] in WRITE_CHANNEL_MODULES, (name, site)
     # every other forbidden name stays data-only (string literal / setattr target)
     for name in FORBIDDEN_CALLS:
-        if name in CHANNEL_ONLY or name in NAME_USAGE_SKIP:
+        if name in CHANNEL_ONLY or name in NAME_USAGE_SKIP or name in V2_CLIENT_ONLY:
             continue
         assert not uses.get(name), f"{name} must stay data-only, found code use at {uses[name]}"
+    # v2-client-only methods: no code use inside the v2 transport (it uses cancel_orders([id]))
+    for name in V2_CLIENT_ONLY:
+        leaked = [site for site in uses.get(name, []) if site.startswith("v2_transport.py:")]
+        assert not leaked, f"{name} must stay data-only inside v2_transport.py: {leaked}"
 
     # the smoke orchestrator must reach the write path only through the channel module
     smoke_text = (ROOT / "live" / "smoke.py").read_text(encoding="utf-8")
@@ -439,7 +454,7 @@ def test_static_no_order_path():
                and node.func.attr in SIGN_ONLY_CALLS
                for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))))
     }
-    assert signers == {"sign_dryrun.py", SUBMIT_MODULE}, f"unexpected signing modules: {signers}"
+    assert signers == {"sign_dryrun.py", *WRITE_CHANNEL_MODULES}, f"unexpected signing modules: {signers}"
 
 
 # --------------------------------------------------------------------------- Phase 2: order_plan
@@ -1339,6 +1354,63 @@ def test_rescue_cancel_scope_and_price_match():
     assert "get_orders" not in client3.calls, client3.calls
 
 
+# ---------------------------------------------------------------- Phase 3b: port + v2 transport
+
+def test_shared_gate_validation_is_strict():
+    """F1: a truthy ``ok`` is not enough — every individual gate check must have passed."""
+    assert submit.GATE_CHECKS == ("cli_flag", "env_flag", "confirm_phrase"), submit.GATE_CHECKS
+    strict_cases = [
+        ({"ok": True}, False),
+        ({"ok": True, "checks": {}}, False),
+        ({"ok": True, "checks": {"cli_flag": True}}, False),
+        ({"ok": True, "checks": {"cli_flag": True, "env_flag": True}}, False),
+        ({"ok": True, "checks": {"cli_flag": True, "env_flag": True, "confirm_phrase": False}}, False),
+        ({"ok": False, "checks": {"cli_flag": True, "env_flag": True, "confirm_phrase": True}}, False),
+        ({}, False), (None, False), ("ok", False),
+        ({"ok": True, "checks": {"cli_flag": True, "env_flag": True, "confirm_phrase": True}}, True),
+    ]
+    for gates, expected in strict_cases:
+        assert submit.gates_all_passed(gates) is expected, gates
+    # the v1 channel really consumes the shared check (forged record ⇒ refused, even with a
+    # gate-flag-only kwarg path)
+    import inspect
+    source = inspect.getsource(submit.submit_order)
+    assert "gates_all_passed" in source, "submit_order must use the shared gate check"
+    assert "gates_all_passed" in inspect.getsource(v2_transport.execute_leg), \
+        "execute_leg must use the shared gate check"
+
+
+def test_port_reuses_v1_safety_machinery():
+    """The v2 channel must reuse — not fork — the audited v1 gate/audit/check machinery."""
+    assert v2_transport.submit is submit, "v2 transport must call the same submit module"
+    assert v2_transport.submit.gate_status is submit.gate_status
+    assert v2_transport.submit.audit is submit.audit
+    assert v2_transport.submit.check_non_marketable is submit.check_non_marketable
+    assert v2_transport.submit.check_limits is submit.check_limits
+    assert v2_transport.submit.gates_all_passed is submit.gates_all_passed
+    assert port.submit is submit and port.risk_gate is risk_gate
+    # the v2 sentinel list is the v2 method surface, released with the same least privilege
+    assert set(v2_transport.RELEASE_WRITE_METHODS) == {"post_order", "cancel_orders"}
+    assert "cancel_orders" in v2_transport.SUBMIT_METHODS
+    assert "post_order" in v2_transport.SUBMIT_METHODS
+    for name in ("create_and_post_market_order", "create_or_derive_api_key", "revoke_builder_api_key"):
+        assert name in v2_transport.SUBMIT_METHODS + v2_transport.ADMIN_METHODS, name
+    assert v2_transport.QTY > 0
+
+
+def test_port_live_limits_read_live_env():
+    env = dict(VALID_ENV, LIVE_FIRE_BUDGET_USDC="12", LIVE_MAX_OPEN_POSITIONS="10",
+               LIVE_MAX_CAPITAL_USDC="50")
+    limits = port.live_limits(env)
+    assert limits == {"fire_budget_usdc": "12", "max_open_positions": "10",
+                      "max_capital_usdc": "50"}, limits
+    status = port.port_status({"mode": "paper"}, env=env)
+    assert status["ok"] is True and status["mode"] == "paper"
+    live_status = port.port_status({"mode": "live"}, env=env)
+    assert live_status["ok"] is False and live_status["limits"] == limits, live_status
+    assert not any(v is None for v in live_status["limits"].values())
+
+
 # --------------------------------------------------------------------------- Phase 3: bucket selection
 
 class _FakeSummary:
@@ -1782,6 +1854,9 @@ CHECKS = [
     ("dry-run: sentinel coverage over client surface", test_sentinel_coverage_over_client_surface),
     ("order_plan: load_caps fails closed", test_load_caps_fails_closed),
     ("dry-run: fails closed when caps unreadable", test_dryrun_fails_closed_when_caps_unreadable),
+    ("submit: shared gate validation is strict (F1)", test_shared_gate_validation_is_strict),
+    ("port: reuses v1 gate/audit/checks", test_port_reuses_v1_safety_machinery),
+    ("port: live limits come from LIVE_* env", test_port_live_limits_read_live_env),
     ("submit: triple gate matrix", test_submit_gate_matrix),
     ("submit: non-marketable check", test_submit_non_marketable),
     ("submit: per-order + cumulative limits", test_submit_limits),

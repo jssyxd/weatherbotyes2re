@@ -72,3 +72,82 @@ jq . data/yes2re_health.json
 - CheckWX key 在 `~/.env`; 轮换后更新该文件 (勿提交, gitignored).
 - 巡察/汇总脚本存放于 `~/.hermes/scripts/` (Hermes cron 要求), 非仓库内; 改动后 `hermes cron` 引用同名仍生效.
 - 若本 omp 会话/机器重启, `paper_runner` hub 服务与 hermes cron gateway 均需确认起来 (本轮已 persist runner; gateway pid 1596 为系统级).
+
+## 7. LIVE (CLOB v2) 部署与观测镜像 — Phase 3b
+
+> 状态：**未启用**。当前 my155 跑的是 `yes2re-paper`（`cfg["mode"]="paper"`）。以下为操作者
+> 拍板后切 live 的步骤与镜像观测方案；本仓库不改任何服务、不改 `.env`、不改 cron。
+
+### 7.1 前置事实
+
+- Polymarket 已于 **2026-04-28** 迁 CLOB **v2**：旧 `py-clob-client`（v1）下单会被拒（`invalid order version`）。
+  必须用 `py-clob-client-v2`（`import py_clob_client_v2`），venv 位于 my155 的 `/root/live-probe-v2/.venv`。
+- 账户实测：`signature_type=1` (POLY_PROXY) + funder `0x6f7d…` + 现有 API 凭据可被接受（`status=live`）。
+- 只读自检（零下单）：`/root/live-probe-v2/.venv/bin/python live/v2_transport.py --version` → 应打印
+  `clob server version: 2`；`--open-orders` → `open orders: 0`。
+
+### 7.2 切 live 的闸门（三者缺一：`fire_port_refused` 事件，不开仓，**不会降级成 paper**）
+
+```bash
+# ① 引擎模式（config 由操作者改，仓库内不预置）
+#    config/yes2re_reversal.json → "mode": "live"      ← 唯一允许的配置改动
+# ② 服务侧三闸门（写进 systemd 单元，绝不写进 .env）
+#    Environment=YES2RE_LIVE_ENABLE_SUBMIT=1
+#    Environment=LIVE_SUBMIT_ENABLED=1
+#    Environment=YES2RE_LIVE_CONFIRM=SMOKE-$(date -u +%Y-%m-%d)   # 日期短语，过期即拒
+# ③ 硬上限（同一单元内，按需放大）
+#    Environment=LIVE_FIRE_BUDGET_USDC=12
+#    Environment=LIVE_MAX_OPEN_POSITIONS=10
+#    Environment=LIVE_MAX_CAPITAL_USDC=50
+```
+`YES2RE_LIVE_CONFIRM` 是**日期短语**：服务跨过 UTC 零点后闸门失效 → 需重启单元（或改用
+`systemd` 的 `EnvironmentFile` + 每日重载）。这是刻意的：连续无人值守放量属 Phase 4。
+
+### 7.3 systemd 单元（镜像 `yes2re-paper`）
+
+```ini
+# /etc/systemd/system/yes2re-live.service   (与 yes2re-paper 逐行同构，仅 mode/venv/闸门不同)
+[Unit]
+Description=weatherbotyes2re LIVE (CLOB v2)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/weatherbotyes2re
+EnvironmentFile=/root/weatherbotyes2re/.env
+Environment=YES2RE_LIVE_ENABLE_SUBMIT=1
+Environment=LIVE_SUBMIT_ENABLED=1
+Environment=YES2RE_LIVE_CONFIRM=SMOKE-CHANGE_ME_DAILY
+ExecStart=/root/live-probe-v2/.venv/bin/python reversal_runner.py run --config config/yes2re_reversal.json
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+> 注意：`reversal_runner.py` 入口当前硬拒非 paper 模式（Phase 3 的安全约束）；切 live 前需操作者
+> 明确解除该入口限制（本仓库未改）。`live/port.py` 已按 `cfg["mode"]` 就绪。
+
+### 7.4 观测镜像（复用**同一套**观察脚本与 cron）
+
+my155 的 `data/` 是唯一真源；**镜像回本机后用同一套** `~/.hermes/scripts/reversal_observe.py` /
+`reversal_triage.py` 与本机 cron 观测，**频率不变：每 30 分钟**；汇报内容不变：**①开仓 ②当前权益**。
+
+```bash
+# my155 → 本机（只拉观测面，不拉密钥；data/ 已在 .gitignore）
+rsync -az --partial my155:/root/weatherbotyes2re/data/ \
+      /home/da/桌面/poly-yes2/weatherbotyes2re-mirror/data/
+# 本机观察（脚本不变、cron 条目不变，仅指向镜像目录）
+WBY2RE_ROOT=/home/da/桌面/poly-yes2/weatherbotyes2re-mirror \
+  python3 ~/.hermes/scripts/reversal_observe.py | python3 -m json.tool
+hermes cron list | grep -E "reversal-(report|watch)"     # 频率仍 30min
+```
+镜像语义：
+- `data/yes2re_health.json` / `data/yes2re_events.jsonl` / `data/yes2re_state.json` 与 paper 完全同 schema
+  （端口模型不改状态字段），所以既有 watcher 判据（`runner.alive`、`feed_health`、`anomalies`、
+  `activity_30m`、`trades`）**无需改动**即可用于 live。
+- live 额外可见：`data/live_events.jsonl`（intent/deny/submit/cancel/residual_risk）与
+  `fire_port_refused` 事件（闸门缺失、风控拒绝时）。
+- 对账口径：`capital_initial_usdc`/`debit_usdc`/`open_positions` 与真实 CLOB 挂单/持仓应逐值吻合；
+  不一致即停（`live/reconcile.py --json` 是独立只读对账入口）。

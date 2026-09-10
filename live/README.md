@@ -1,14 +1,31 @@
-# live/ — 实盘执行层 (Phase 1 只读对账 · Phase 2 干跑签名)
+# live/ — 实盘执行层 (Phase 1 只读对账 · Phase 2 干跑签名 · Phase 3 受控写通道 · Phase 3b 执行端口)
 
-**Phase 1 纯只读；Phase 2 只在本地签名。** 任何阶段都不存在提交订单的代码路径 ——
-Phase 1 只用 `py-clob-client` 的**只读**端点 (`/balance-allowance`、`/data/orders` GET)
-和 data-api (`/positions` GET)、ipinfo.io；Phase 2 额外用 `create_order()`
-(**签名只在本地做**，网络侧只有 `/book`、`/fee-rate` 等 GET) 加运行时哨兵。
-`tests_live.py` 用 AST 静态断言 `live/*.py` 里不存在任何下单/撤单**调用**
-(名字只允许作为字符串字面量 / `setattr` 替换目标出现)。
+**总原则：live 与 paper 同策略、同逻辑、同基建，只有"成交通道"不同。** 引擎 (`_r_cycle.py`) 照旧做
+数据拉取 / arm-fire 判定 / 时间窗 / 共识过滤 / sleeve / leg sizing / 状态 schema / 事件 / 健康文件 /
+结算记账；差异只发生在"怎么成交"这一层（Phase 3b 的 `live/port.py`）。
 
-paper 引擎 (`reversal_*.py` / `_r_*.py` / `runner_impl.py`) 未做任何改动，本包与它
-完全独立 (不 import 任何 paper 模块)。
+| 阶段 | 能力 | 写路径 | 状态 |
+|------|------|--------|------|
+| **Phase 1** | 只读对账：余额/授权/挂单/持仓/出口/风控预判 | **无**（`py-clob-client` 只读端点 + data-api + ipinfo.io，全 GET） | ✅ |
+| **Phase 2** | 干跑签名：本地 EIP-712 签名、产物不可提交 | **无**（`create_order()` 本地签名；网络侧只有 `/book`、`/fee-rate` 等 GET） | ✅ |
+| **Phase 3** | 冒烟单 + 受控提交通道（**v1 CLOB**，见下方"legacy"标注） | 有：`live/submit.py`（`post_order`/`cancel`），由冒烟单/人工触发 | ✅（**v1 订单已被 CLOB 拒**） |
+| **Phase 3b** | 执行端口 + **CLOB v2** 真实通道 | 有：`live/v2_transport.py`（`post_order`/`cancel_orders`），仅引擎经端口调用 | ✅ 端口就绪，**live 未接信号** |
+
+**写路径的静态保证（与上面这张表一致）**：`tests_live.py` 用 AST 断言**每个写通道恰好一处**下单调用点
+（`submit.py` 一处 `post_order`、`v2_transport.py` 一处 `post_order`），写调用只允许出现在这两个通道模块内
+（其它模块只能**委托**：`submit.submit_order(...)` / `submit.cancel_order(...)`），禁止调用"调用的结果"
+（`f()()`），且禁用名单里的名字在通道内只能作为字符串/`setattr` 目标出现。
+
+**与 engine 的关系（Phase 3b 起）**：`_r_cycle._paper_fire` 的**成交段**已改为经执行端口
+（`live/port.py`，`_r_cycle.py` 仅 +31/−8）；为此 `live/port.py` **确实** import 了仓库内的
+`re_execution` / `paper_capital`（paper 成交与记账），这是"同基建"的刻意选择。策略/数据/估值类模块
+（`reversal_strategy.py`、`consensus_tracker.py`、`sleeve_signal.py`、`equity_valuation.py`、
+`research/*`、`market_adapter.py`）**零改动**。
+
+**第三方依赖（两个，都在仓库外的独立 venv；本仓库仍是 stdlib-only，不加 requirements.txt）**：
+`py-clob-client`（v1，Phase 1/2/3 与冒烟单）在 `~/桌面/poly-yes2/live-probe/.venv`；
+`py-clob-client-v2`（Phase 3b 真实通道）在 `~/桌面/poly-yes2/live-probe-v2/.venv`。
+**v2 SDK 只被惰性导入**：paper 路径与 stdlib 单测永不加载它。
 
 ## 运行方式
 
@@ -153,7 +170,13 @@ $VENV live/sign_dryrun.py --scenario --confirm-dryrun --json --out /tmp/dryrun.j
 **上限读不到就拒绝**（`load_caps()` 缺键/非法/越界 → `CapsError` → `ok:false` + exit 2），
 不会退化成"无上限"。
 
-## Phase 3 — 冒烟单 (受控的真实提交通道)
+## Phase 3 — 冒烟单 (受控的真实提交通道 · **legacy v1 通道**)
+
+> ⚠ **历史通道说明**：本节描述的是 **CLOB v1** 通道（`live/submit.py` + `live/smoke.py`）。
+> Polymarket 自 **2026-04-28** 起迁到 v2，**v1 签名订单会被服务端拒绝**（`invalid order version`），
+> 因此这两个文件现在只用于：① 承载**安全机制本体**（三重闸门 / 哨兵 / 审计 / 被动性与限额检查，
+> 两者被 Phase 3b 的 v2 通道**复用**）；② 离线与小规模演练。**任何真实下单请走 Phase 3b 的 v2 通道**
+> （`live/v2_transport.py`）。下文命令保留为历史与排障参考。
 
 **性质变化**：Phase 1/2 的铁律是"写路径不可达"；Phase 3 需要一条**受控、最小**的真实写路径，
 于是要求变成：**写路径不可误触发、不可超限、每一步可审计**。整个包内只有 `live/submit.py`
@@ -211,7 +234,10 @@ $VENV live/smoke.py --enable-submit \
    冒烟单价格 = `min(best_bid, best_ask − 2·tick)`，向下对齐到 tick，且 ≥ 1 tick；
    下单时再叠加 `post_only=True`（交易所侧 maker-only 兜底）
 
-### 最小权限哨兵
+### 最小权限哨兵（v1 通道）
+
+> 同样属 legacy：下列 21 个 v1 方法名对应 `py-clob-client`（v1）。CLOB v2 的写法见
+> Phase 3b 小节的"最小权限 + 审计"（**25 个写面 / 释放 2 / 只读 6**）。
 
 先按 Phase 2 装齐全部 21 个哨兵，然后**只解除** `post_order` + `cancel`（写）；
 `get_order`/`get_orders`/`get_trades`/`get_balance_allowance` 是只读调用（Phase 2 从未拦截，
@@ -229,6 +255,12 @@ $VENV live/smoke.py --enable-submit \
 每个动作（意图/拒绝/提交/查询/撤单/异常/救援）追加一行 JSON 到 `data/live_events.jsonl`：
 `ts_utc` / `action` / `reason` / `params`(已脱敏，键名含 key/secret/pass/priv/signature 一律 `<redacted>`)
 / `response_summary` / `order_id`。日志写不进去 → 抛 `AuditError` 拒绝动作（没有审计就不许动手）。
+
+**日志卫生约定（quarantine 指针）**：`data/live_events.jsonl` 只记**真实动作**。历史上线发现测试/桩
+传输的残渣（order id 形如 `ORD-*`、token `TOK`，绝无真实 CLOB 单号）会被**逐字搬**到
+`data/live_events.test_debris.jsonl`（**不删除**），并在**主日志**追加一条 `action=note`、
+`reason=debris_pointer` 的记录指向该文件；测试侧自 `tests_live.py` / `tests_port.py` 起在 import 时
+即把 `submit.AUDIT_PATH` 指向临时文件，确保套件永远不写真实日志。
 
 ### 失败时的人工处置
 
@@ -253,8 +285,104 @@ $VENV live/smoke.py --enable-submit \
 ### 尚未开启的部分
 
 **真实信号接入尚未开启**：Phase 3 只到"人工触发一次冒烟单"为止。策略信号 → 下单的自动链路
-（Phase 4 放量、多城市并发、逐级放大 `LIVE_*`）**没有实现**，`live/submit.py` 也不会被
-paper 引擎调用（paper 引擎一行未改）。
+（Phase 4 放量、多城市并发、逐级放大 `LIVE_*`）**没有实现**。
+
+引擎侧的现状以 Phase 3b 小节为准：`_r_cycle._paper_fire` 的**成交段**已改为经执行端口
+（`live/port.py`），paper 模式下走 `PaperPort`（行为与改动前逐字段一致）；策略判定/时间窗/共识/
+sleeve/leg sizing/状态 schema/事件/结算记账**未改**。`live/submit.py` 本身仍只由**人工**触发
+（冒烟单/手工撤单），不会被引擎自动调用。
+
+## Phase 3b — 执行端口 (port) + CLOB v2
+
+**核心原则：live 与 paper 同策略、同逻辑、同基建，只有"成交通道"不同。** 不是另写一个 bot，也不是
+在策略里加 `if live:` 分支：引擎照旧做数据拉取 / arm-fire 判定 / 时间窗 / 共识过滤 / sleeve /
+leg sizing / 状态 schema / 事件 / 健康文件 / 结算记账，只把"怎么成交"抽成端口。
+
+```
+_r_cycle._paper_fire(...)                  ← 同一段 ladder / 记账 / 建档逻辑 (未改策略)
+        │
+        ├─ port.preflight(fire, cfg)       ← paper: 恒允许；live: 真实余额/持仓 + LIVE_* 硬上限
+        ├─ port.match(leg, book, limit, shares)
+        │        ├─ PaperPort : re_execution.paper_match_fak   (in-memory FAK, 逐字不变)
+        │        └─ LivePort  : live/v2_transport.execute_leg  (真实 CLOB v2 下单 + 成交对账)
+        └─ port.fund(state, cfg, fire, total_cost)   ← 两种模式都用 paper_capital.reserve 记同一本账
+```
+
+### 文件
+
+| 文件 | 作用 |
+|------|------|
+| `live/port.py` | 端口契约 + `PaperPort` / `LivePort` + `get_port(cfg, env)` / `port_status()` |
+| `live/v2_transport.py` | CLOB **v2** 传输层（由 `live/submit.py` 演进）：三重闸门 + 最小权限哨兵 + 审计日志 + 真下单/查询/撤单 + 成交对账 |
+
+### 为什么必须迁 v2
+
+Polymarket 已于 **2026-04-28** 迁到 CLOB v2；旧 `py-clob-client`（v1，`import py_clob_client`）已被官方归档，
+**所有订单都会被拒**（`invalid order version`）。v2 SDK 是 `py-clob-client-v2`（`import py_clob_client_v2`），
+装在独立 venv：`~/桌面/poly-yes2/live-probe-v2/.venv`（本机）/ `/root/live-probe-v2/.venv`（my155）。
+本账户实测：`signature_type=1` (POLY_PROXY) + funder + 现有 API 凭据可被接受（`status=live`）。
+
+v2 差异（本模块已处理）：creds 显式传入（v2 无 `create_or_derive_api_creds`）；撤单用 **`cancel_orders([id])`**
+（单参 `cancel_order` 易抛 `AttributeError`）；挂单查询用 **`get_open_orders()`**（无 `get_orders`）；
+`create_order()` 返回 **`SignedOrderV2` 对象**（无 `.get()`，用属性/`__dict__`）；
+**提交前必须重取盘口并夹紧价格**，否则 `post_only` 被拒（`order crosses book`）；
+服务端 `get_version()` 返回 **2**。
+
+```bash
+V2=/home/da/桌面/poly-yes2/live-probe-v2/.venv/bin/python
+$V2 live/v2_transport.py --status        # 闸门状态 + 可释放清单（零网络）
+$V2 live/v2_transport.py --version       # clob server version: 2（只读）
+$V2 live/v2_transport.py --open-orders   # 只读：当前挂单
+```
+
+### 三重闸门（服务侧版本）
+
+引擎不是 CLI 工具，所以三个闸门换成**环境变量**（全部**刻意不写进 `.env`**）；缺任何一个：
+`get_port()` 抛 `PortRefused(reason)`，`_r_cycle` 记 `fire_port_refused` 事件并**不开仓**——
+**绝不静默降级成 paper**。
+
+| # | 闸门（live 模式） | 防的是什么 |
+|---|------------------|-----------|
+| ① | `YES2RE_LIVE_ENABLE_SUBMIT=1` | 误调用：服务/脚本没有显式导出它就跑不了写路径 |
+| ② | `LIVE_SUBMIT_ENABLED=1` | 误机器/误会话：只加载 `.env` 的进程（本机排查、测试）永远是只读 |
+| ③ | `YES2RE_LIVE_CONFIRM=SMOKE-<UTC日期>` | 陈旧重放：日期短语过期即拒，强制操作者当天确认 |
+| — | `cfg["mode"] == "live"` | 引擎模式本身；当前部署是 `paper`（默认），`reversal_runner.py` 亦拒绝非 paper |
+
+### 最小权限 + 审计（沿用 v1 机制）
+
+- 先装齐 v2 全部写面哨兵 —— **25 个方法，逐项如下（与 `live/v2_transport.py` 的四个常量一一对应）**：
+
+  | 组 | 数量 | 方法（常量） |
+  |----|------|--------------|
+  | order-entry | **8** | `create_and_post_order` / `create_and_post_market_order` / `post_order` / `post_orders` / `cancel_order` / `cancel_orders` / `cancel_all` / `cancel_market_orders`（`SUBMIT_METHODS`） |
+  | credential-admin / allowance | **9** | `create_api_key` / `create_or_derive_api_key` / `create_builder_api_key` / `create_readonly_api_key` / `delete_api_key` / `delete_readonly_api_key` / `derive_api_key` / `revoke_builder_api_key` / `update_balance_allowance`（`ADMIN_METHODS`） |
+  | state-write | **2** | `post_heartbeat`（POST `/v1/heartbeats`，可撤下全部挂单） / `drop_notifications`（DELETE `/notifications`）（`STATE_WRITE_METHODS`） |
+  | RFQ | **6** | `create_rfq_request` / `cancel_rfq_request` / `create_rfq_quote` / `cancel_rfq_quote` / `accept_rfq_quote` / `approve_rfq_order`（`RFQ_SUBMIT_METHODS`） |
+  | **合计** | **25** | 8 + 9 + 2 + 6 |
+
+  然后**只放出 2 个写方法**（`RELEASE_WRITE_METHODS`）：`post_order` + `cancel_orders`；其余 **23** 个保持拦截
+  （真实 client 实测 `still_blocked_count = 23`）。另放行 6 个**只读**方法（`RELEASE_READ_METHODS`，
+  Phase 2 从未拦截过）：
+  `get_order`/`get_open_orders`/`get_trades`/`get_balance_allowance`/`get_order_book`/`get_tick_size`）。
+  注意 `cancel_order`（单参 `DELETE /order`）**装哨兵但永不放出**：安全形式是 `cancel_orders([id])`；
+  想手工撤单请用 `live/submit.py --cancel-order <id>` 或 `live/v2_transport.py --cancel-order <id>`。
+- 闸门 / 审计（`data/live_events.jsonl`，含拒绝）/ `check_non_marketable` / `check_limits` 全部**复用**
+  `live/submit.py` 的实现（同一函数对象），v2 不另起一套。
+- 下单：`post_only=True` + **提交前重取盘口夹紧**（BUY ≤ `best_ask − tick`、SELL ≥ `best_bid + tick`，
+  仍须被动）；下单**不重试**（重试会双开）。
+- 成交对账：轮询 `get_order` + `get_trades` 至终态或超时，把**真实成交量/均价**回报给引擎；
+- 撤单：`cancel_orders([id])` **失败重试 3 次**，仍失败 → 结果带 `residual_risk=True` 并写审计。
+
+### 已知限制（Phase 3b）
+
+1. **未接真实信号**：`cfg["mode"]` 仍是 `paper`，三个闸门也未配置；live 端口已就绪但不会被自动触发。
+2. 真实成交的**手续费/返佣**未入账（`paper_capital` 只记成本）；Phase 4 需要时按 `get_trades` 的
+   `fee_rate_bps` 扩展。
+3. `poll_fill` 的均价优先取 `get_trades`（按 orderID 归属），取不到时退化为订单限价。
+4. 部分成交后剩余量的撤单依赖 `cancel_orders`；服务端极端情况下可能已成交（`post_only` 下概率极低），
+   此时 `residual_risk` 会明确标注。
+5. paper 与 live 共用同一本账（`paper_total_debit_usdc`）——live 模式下它就是真实支出账本；
+   两模式**不要混跑**同一份 state。
 
 ## 阶段梯子
 
@@ -263,6 +391,7 @@ paper 引擎调用（paper 引擎一行未改）。
 | **Phase 1** | 只读对账：余额/授权/挂单/持仓/出口/风控预判 | 只有 GET | ✅ 本包实现 |
 | **Phase 2** | 干跑签名：真实构建订单并本地签名，**不提交**；哨兵 + 产物不可提交 | 本地签名 + 只读 GET | ✅ 本包实现 |
 | **Phase 3** | 冒烟单：5 USDC 非可成交限价单，人工触发 → 查单 → 撤单 → 对账 | 三重闸门 + 最小权限写 | ✅ 本包实现（真实下单由操作者在 my155 触发） |
+| **Phase 3b** | 执行端口 + CLOB v2：live/paper 同策略同逻辑同基建，仅成交通道不同 | 端口选择（三闸门拒则不开仓） | ✅ 本包实现（live 未接信号） |
 | **Phase 4** | 放量：多城市并发、逐级放大 `LIVE_*` 上限 | 常态实盘 | 待做 |
 
 升级闸门（每一级都必须满足才进下一级）：Phase 1 连续 N 天 `ok=true` 且余额/挂单与人工

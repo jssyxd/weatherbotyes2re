@@ -35,6 +35,7 @@ from _r_exec import settle_markets
 from _r_globals import book_cache, bump, clob, set_health_extra, stamp, tracker
 from _r_state import DEFAULTS, log_event
 from adapters.polymarket.orderbook import from_any
+from live.port import PortRefused, get_port
 from paper_capital import close_leg_at_best_bid, reserve
 from research import common
 from reversal_strategy import ensure_re_state, maybe_arm_or_fire, prune_stale_sessions
@@ -825,7 +826,25 @@ def _paper_fire(
 
     Mirrors the sim's ``run_fire_window`` but against the live normalized
     ladder cache, reserving real paper cash and recording the position on the
-    state blob. Returns (position_legs_or_None, ladder_log)."""
+    state blob. Returns (position_legs_or_None, ladder_log).
+
+    The fill itself goes through the execution port (``live/port.py``): paper keeps the
+    in-memory capped FAK matcher, live sends these very same intents to the real CLOB
+    ("how a fill happens" is the only difference). Strategy, sizing, windows, state
+    schema and bookkeeping stay identical in both modes.
+    """
+    try:
+        port = get_port(cfg)
+    except PortRefused as exc:
+        # live requested without its gates: stand down loudly, never downgrade to paper
+        log_event(cfg.get("log_path"), {"type": "fire_port_refused", "key": fire.get("key"),
+                                        "reason": exc.reason, "detail": exc.detail})
+        return None, [{"status": "port_refused", "reason": exc.reason, "detail": exc.detail}]
+    pre = port.preflight(fire=fire, cfg=cfg)
+    if not pre["ok"]:
+        log_event(cfg.get("log_path"), {"type": "fire_port_refused", "key": fire.get("key"),
+                                        "reason": pre["reason"], "detail": pre["detail"]})
+        return None, [{"status": "port_refused", "reason": pre["reason"], "detail": pre["detail"]}]
     cache = book_cache()
     is_sleeve = bool(fire.get("sleeve"))
     if is_sleeve:
@@ -871,10 +890,13 @@ def _paper_fire(
             ladlog.append(intent)
             if intent.get("status") != "send_fak":
                 continue
-            match = re_execution.paper_match_fak(
-                cache.get(intent.get("token_id")) if intent.get("token_id") in cache else {},
-                Decimal(intent["limit_price"]),
-                Decimal(intent["shares"]),
+            match = port.match(
+                leg=intent,
+                book=cache.get(intent.get("token_id")) if intent.get("token_id") in cache else {},
+                limit=Decimal(intent["limit_price"]),
+                shares=Decimal(intent["shares"]),
+                fire=fire,
+                cfg=cfg,
             )
             fills[intent["leg"]]["shares"] += match["filled_shares"]
             fills[intent["leg"]]["cost"] += match["cost"]
@@ -888,9 +910,10 @@ def _paper_fire(
                 fills[intent["leg"]]["fill_price"] = str(match["avg_price"])
 
     total_cost = sum((fills[k]["cost"] for k in fills), ZERO)
-    # Fail closed: if we could not reserve the filled cost, stand the whole
-    # fire down (do not record a position we cannot fund).
-    if total_cost > ZERO and reserve(state, total_cost) is None:
+    # Fail closed: if the ledger cannot book the filled cost, stand the whole fire down
+    # (do not record a position we cannot fund). The ledger is shared by every mode.
+    funding = port.fund(state=state, cfg=cfg, fire=fire, total_cost=total_cost)
+    if total_cost > ZERO and not funding["ok"]:
         log_event(cfg.get("log_path"), {"type": "fire_insufficient_capital", "key": fire["key"], "need": str(total_cost)})
         return None, ladlog
     # Start ledger baseline: paper_account debit already incremented by reserve.

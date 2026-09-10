@@ -73,6 +73,9 @@ CONFIRM_PREFIX = "SMOKE"
 _SECRET_HINTS = ("key", "secret", "pass", "priv", "signature")
 
 #: gate codes
+#: the three gate checks that must *all* be true (a truthy ``ok`` alone is not enough)
+GATE_CHECKS = ("cli_flag", "env_flag", "confirm_phrase")
+
 GATE_OK = "ok"
 GATE_FLAG = "submit_flag_missing"
 GATE_ENV = "submit_env_missing"
@@ -101,6 +104,18 @@ def _now_iso() -> str:
 
 
 # --------------------------------------------------------------------------- gates
+
+def gates_all_passed(gates) -> bool:
+    """True only when the record says ``ok`` **and** every individual gate check passed.
+
+    Shared by both write channels (v1 ``submit_order`` and v2 ``execute_leg``) so a forged or
+    truncated gate record can never unlock a write.
+    """
+    if not isinstance(gates, dict) or not gates.get("ok"):
+        return False
+    checks = gates.get("checks") or {}
+    return all(checks.get(key) for key in GATE_CHECKS)
+
 
 def phrase(now: datetime | None = None) -> str:
     """Today's confirm phrase (UTC-dated ⇒ not replayable tomorrow)."""
@@ -379,8 +394,7 @@ def submit_order(client, *, token_id: str, price, size, side: str = "BUY", gates
     A failure here is reported with ``residual_risk: True`` because we cannot know whether
     the exchange accepted the order before the connection died; the caller must reconcile.
     """
-    if not isinstance(gates, dict) or not gates.get("ok") or not all(
-            (gates.get("checks") or {}).get(key) for key in ("cli_flag", "env_flag", "confirm_phrase")):
+    if not gates_all_passed(gates):
         audit({"action": "deny", "reason": "gates_missing",
                "params": {"intent": "submit_order", "token_id": token_id, "price": str(price)}})
         raise PermissionError("submit_order refused: all three gates must pass in this invocation")
