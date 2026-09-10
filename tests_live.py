@@ -1242,7 +1242,7 @@ class _SmokeClient:
     """Fake v2 client: records writes, serves reads. No network, no real order."""
 
     def __init__(self, *, status="live", size_matched="0", cancel_ok=True,
-                 status_after_cancel="canceled", open_orders=(0,)):
+                 status_after_cancel="canceled", open_orders=(0,), open_order_id="ORD-1"):
         self.rfq = _FakeRfq()
         self.calls = []
         self._status = status
@@ -1250,6 +1250,7 @@ class _SmokeClient:
         self._cancel_ok = cancel_ok
         self._status_after_cancel = status_after_cancel
         self._open_orders = list(open_orders)
+        self._open_order_id = open_order_id
         self.cancelled = False
         self.list_calls = 0
 
@@ -1267,8 +1268,9 @@ class _SmokeClient:
     def get_open_orders(self):
         self.list_calls += 1
         count = self._open_orders.pop(0) if self._open_orders else 0
-        return [{"id": f"LEFTOVER-{i}", "asset_id": "tok", "side": "BUY", "price": "0.5",
-                 "original_size": "10", "size_matched": "0", "status": "live"} for i in range(count)]
+        return [{"id": (self._open_order_id if i == 0 else f"LEFTOVER-{i}"), "asset_id": "tok",
+                 "side": "BUY", "price": "0.5", "original_size": "10", "size_matched": "0",
+                 "status": "live"} for i in range(count)]
 
     def get_trades(self):
         return []
@@ -1766,6 +1768,108 @@ def test_smoke_never_blind_cancels_on_failure():
         smoke.select_tradeable_bucket, submit.list_open_orders = saved
 
 
+def test_smoke_tolerates_open_order_list_lag():
+    """A confirmed cancel + a lagging list endpoint must NOT be reported as residual risk."""
+    client = _SmokeClient(open_orders=(1, 1, 0), open_order_id="ORD-1")   # two stale reads, then clear
+    with tempfile.TemporaryDirectory() as tmp:
+        log = Path(tmp) / "live_events.jsonl"
+        with _stub_clob_types(), _audit_path(log):
+            restore = _patch_smoke(client)
+            try:
+                report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(), budget_usdc="5",
+                                         env=_flow_env(), sleep=lambda _s: None, attempts=2,
+                                         open_orders_attempts=3, open_orders_sleep=0,
+                                         reconcile_fn=lambda env, **kw: _snapshot())
+            finally:
+                restore()
+        actions = [(line["action"], line["reason"]) for line in _audit_lines(log)]
+    check = report["open_orders_check"]
+    assert report["ok"] is True and report["exit_code"] == 0, report["reason"]
+    assert report["residual_risk"] is False, report
+    assert check["status"] == "clear" and check["attempts"] == 3 and check["lag_observed"] is True, check
+    assert check["note"] == "cancel_confirmed_but_list_lag", check
+    assert "lag=cancel_confirmed_but_list_lag" in smoke.human_summary(report)
+    assert ("open_orders", "clear") in actions, actions
+
+
+def test_smoke_reports_residual_risk_when_list_persists():
+    """Persistent evidence ⇒ real residual risk; a different order id too."""
+    # (a) our own cancelled id never clears → residual risk, with an explicit reason
+    persistent = _SmokeClient(open_orders=(1, 1, 1, 1), open_order_id="ORD-1")
+    with tempfile.TemporaryDirectory() as tmp:
+        with _stub_clob_types(), _audit_path(Path(tmp) / "l.jsonl"):
+            restore = _patch_smoke(persistent)
+            try:
+                report = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(), budget_usdc="5",
+                                         env=_flow_env(), sleep=lambda _s: None, attempts=2,
+                                         open_orders_attempts=3, open_orders_sleep=0,
+                                         reconcile_fn=lambda env, **kw: _snapshot(orders=1))
+            finally:
+                restore()
+    assert report["ok"] is False and report["exit_code"] == 2
+    assert report["residual_risk"] is True, report
+    assert report["reason"] == "cancel_confirmed_but_list_still_shows_order", report["reason"]
+    assert report["open_orders_check"]["remaining_ids"] == ["ORD-1"], report["open_orders_check"]
+    assert "RESIDUAL RISK" in smoke.human_summary(report)
+    assert persistent.list_calls == 3, persistent.list_calls          # bounded: 3 reads, no more
+
+    # (b) a *different* order id ⇒ residual risk immediately (never attributed to list lag)
+    foreign = _SmokeClient(open_orders=(1, 1, 1), open_order_id="SOMEONE-ELSE")
+    with tempfile.TemporaryDirectory() as tmp:
+        with _stub_clob_types(), _audit_path(Path(tmp) / "l.jsonl"):
+            restore = _patch_smoke(foreign)
+            try:
+                report2 = smoke.run_smoke(enable_submit=True, confirm=submit.phrase(), budget_usdc="5",
+                                          env=_flow_env(), sleep=lambda _s: None, attempts=2,
+                                          open_orders_attempts=3, open_orders_sleep=0,
+                                          reconcile_fn=lambda env, **kw: _snapshot(orders=1))
+            finally:
+                restore()
+    assert report2["ok"] is False and report2["residual_risk"] is True
+    assert report2["reason"] == "other_orders_remain", report2["reason"]
+    assert report2["open_orders_check"]["attempts"] == 1, report2["open_orders_check"]
+    assert foreign.list_calls == 1, foreign.list_calls
+
+
+def test_await_no_open_orders_branches():
+    """Unit-level: the helper's own branches (pure, one fake client)."""
+
+    class _Client:
+        def __init__(self, sequence, raises=False):
+            self.sequence = list(sequence)
+            self.raises = raises
+            self.calls = 0
+
+        def get_open_orders(self):
+            self.calls += 1
+            if self.raises:
+                raise RuntimeError("list endpoint down")
+            n = self.sequence.pop(0) if self.sequence else 0
+            return [{"id": "ORD-1"}] * n
+
+    with tempfile.TemporaryDirectory() as tmp, _audit_path(Path(tmp) / "l.jsonl"):
+        clear = smoke.await_no_open_orders(_Client([0]), "ORD-1", cancel_confirmed=True,
+                                           attempts=3, sleep_seconds=0, sleep=lambda _s: None)
+        assert clear == {"ok": True, "status": "clear", "attempts": 1, "remaining_ids": [],
+                         "lag_observed": False, "note": ""}, clear
+        lag = smoke.await_no_open_orders(_Client([1, 1, 0]), "ORD-1", cancel_confirmed=True,
+                                         attempts=3, sleep_seconds=0, sleep=lambda _s: None)
+        assert lag["ok"] and lag["lag_observed"] and lag["note"] == "cancel_confirmed_but_list_lag", lag
+        # a lag *without* a confirmed cancel stays a plain (non-lag) clear
+        unconfirmed = smoke.await_no_open_orders(_Client([1, 0]), "ORD-1", cancel_confirmed=False,
+                                                attempts=3, sleep_seconds=0, sleep=lambda _s: None)
+        assert unconfirmed["ok"] and unconfirmed["note"] == "", unconfirmed
+        stuck = smoke.await_no_open_orders(_Client([1, 1, 1]), "ORD-1", cancel_confirmed=True,
+                                           attempts=3, sleep_seconds=0, sleep=lambda _s: None)
+        assert not stuck["ok"] and stuck["status"] == "cancel_confirmed_but_list_still_shows_order", stuck
+        stuck_other = smoke.await_no_open_orders(_Client([1, 1, 1]), "ORD-1", cancel_confirmed=False,
+                                                 attempts=3, sleep_seconds=0, sleep=lambda _s: None)
+        assert not stuck_other["ok"] and stuck_other["status"] == "open_orders_remain", stuck_other
+        broken = smoke.await_no_open_orders(_Client([], raises=True), "ORD-1", cancel_confirmed=True,
+                                            attempts=3, sleep_seconds=0, sleep=lambda _s: None)
+        assert not broken["ok"] and broken["status"] == "list_failed", broken
+
+
 def test_smoke_readonly_preflight_never_writes():
     """--readonly-preflight runs the live chain and stops before the write."""
     client = _SmokeClient()
@@ -1987,6 +2091,9 @@ CHECKS = [
     ("smoke: selection rejects dead buckets only", test_select_tradeable_bucket_only_dead_buckets),
     ("smoke: selection picks near-mid live bucket", test_select_tradeable_bucket_mixed_books),
     ("smoke: denies when no tradeable bucket", test_smoke_denies_when_no_tradeable_bucket),
+    ("smoke: tolerates open-order list lag", test_smoke_tolerates_open_order_list_lag),
+    ("smoke: residual risk when the list persists", test_smoke_reports_residual_risk_when_list_persists),
+    ("smoke: await_no_open_orders branches", test_await_no_open_orders_branches),
     ("smoke: rescue scope + numeric price match", test_rescue_cancel_scope_and_price_match),
     ("smoke: never blind-cancels on failure", test_smoke_never_blind_cancels_on_failure),
     ("smoke: readonly preflight never writes", test_smoke_readonly_preflight_never_writes),

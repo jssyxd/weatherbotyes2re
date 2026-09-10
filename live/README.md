@@ -285,6 +285,8 @@ $VENV live/smoke.py --enable-submit \
 | 现象 | 含义 | 处置 |
 |------|------|------|
 | `submit_failed:*` + `residual_risk=true` | 连接断在提交中，**可能已挂上** | 立刻 `live/submit.py --open-orders`，看到同 token/价格的挂单就 `--cancel-order <id>`（仍需三重闸门） |
+| `cancel_confirmed_but_list_still_shows_order` | 撤单**已确认**，但多次重读（默认 3 次 × 5s，`--open-orders-attempts/--open-orders-interval`）后挂单列表**仍只显示该 id** | 大概率是列表缓存滞留：核对网页端；确认已撤即可忽略（`open_orders_check.note = cancel_confirmed_but_list_lag` 已留痕） |
+| `other_orders_remain` | 列表里出现**不是本次**的挂单 id | 属真实残留 → 按上一行处理（人工撤单/排查） |
 | `cancel_not_confirmed` / `open_orders_remain` | 撤单未确认/仍有挂单 | 同上，必要时到 Polymarket 网页端手动撤 |
 | `unexpected_fill:size_matched=…` | 被动单竟然成交了（不该发生） | 视为**异常事件**上报；剩余挂单会被自动撤，成交部分按真实仓位对账 |
 | `verify:order_not_confirmed` | 下单后查不到 resting 状态 | 视为可能有残留挂单，按第 1 行处置 |
@@ -364,6 +366,7 @@ paper 与 live 实例**共用同一个** `config/yes2re_reversal.json`，避免�
 | `YES2RE_MODE` | `mode` | `paper` \| `live`（大小写/空白已归一） | 其它值 → `SystemExit`（明确报出变量名） |
 | `YES2RE_FIRE_BUDGET_USDC` | `fire_budget_usdc` | 有限正数（支持 `12`、`7.5`、`1e1`） | 非数字/≤0/`NaN`/`inf` → `SystemExit` |
 | `YES2RE_MAX_OPEN_POSITIONS` | `max_open_positions` | 正整数 | `0`/负数/小数/非数字 → `SystemExit` |
+| `YES2RE_INITIAL_CAPITAL_USDC` | `paper_initial_capital_usdc` | 有限正数（**实盘实例填真实账户余额**，让"当前权益"以真实资金起算） | 非数字/≤0/`NaN`/`inf` → `SystemExit` |
 
 规则（与 `_r_state.load_config` 实现一致）：
 
@@ -373,6 +376,9 @@ paper 与 live 实例**共用同一个** `config/yes2re_reversal.json`，避免�
 - **安全锁保留**：**config 文件本身**永远不能把 `mode` 选成 live（`mode: live` 的文件仍被拒）；
   只有**显式**的 `YES2RE_MODE=live` 才能选中 live，且选中时会在 stderr 打一行 WARNING（journal 可见）。
   真正下单还需执行端口的三重闸门（下表），所以"mode=live 但缺闸门"仍是不开仓。
+- **实盘账本起点**：live 实例用 `YES2RE_INITIAL_CAPITAL_USDC=<真实余额>` 对齐账本初始资金
+  （`load_config` 覆盖 `paper_initial_capital_usdc`；仅在 state **尚无持仓/无借记**时用于初始化账本，
+  之后引擎永不改写初始资金），这样镜像出去的健康/权益数值以真实资金起算，而不是配置里的 paper 值。
 - 部署提示：**不要把 `.env` 当 `EnvironmentFile`**（本仓库 `.env` 里有历史遗留的 `YES2RE_MODE=live`），
   否则 paper 实例可能被环境选中 live。单元里用显式 `Environment=` 行（见 `DEPLOY_RUNBOOK.md` §7）。
 

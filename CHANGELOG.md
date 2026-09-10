@@ -1,5 +1,35 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-11 — 运维文档（ops/PENDING.md 待办单一清单）+ LIVE 真实验收记录
+
+- 新增 **`ops/PENDING.md`**：双实例全貌（paper / LIVE）、**4 个待决策项**（LIVE 闸门开启 / config 600 vs 账本 500 / `miami no_book` 永久锁是否重试 / LIVE 结算 claim 未实现）、**5 个 LIVE 技术待办**（账本初始资金对齐真实余额 / my155 WS down / 撤单后列表延迟 / 真实订单运维流程含事故复盘 / 资金规模）、paper 历史遗留、环境变量对照表、安全红线。
+- **文档准确性修正**：引擎侧真实下单需**三个服务级闸门同时满足** —— `YES2RE_LIVE_ENABLE_SUBMIT=1` + `LIVE_SUBMIT_ENABLED=1` + 当日 `YES2RE_LIVE_CONFIRM`（`SMOKE-<UTC 日期>`）；日期短语跨 UTC 零点自动失效需重启单元（刻意设计，防止无人值守长期放量）。`DEPLOY_RUNBOOK` §7 状态与镜像实现说明同步更新。
+- **LIVE 真实验收**（my155，真实资金）：用**本仓库工具** `live/smoke.py` 完成 `下单 → 确认(live, 0 成交) → 撤单(CANCELED)`，复查挂单 0、余额 51.713622 USDC 未变（订单 `0x505a3835…`，BUY 18.51 股 @0.27 = 4.9977 USDC，post-only 不可成交价）。
+- **事故复盘（已处置）**：验收期间一次 vibeshell 会话 kill 误杀前台冒烟进程 → 20 股 @0.25 真实挂单滞留 ~1 分钟，由 `/root/live-probe-v2/cancel.py` 手工撤销（余额未变）。**规则**：真实订单流程必须 `setsid nohup … &` 独立运行（已写入 `ops/PENDING.md` §T-4）。
+- `ops/repair_log_live.md` 建立（LIVE healer 首轮记录：只读账户层断裂 + ws_down 根因定位）。
+
+
+## 2026-09-10 — Phase 3b-4 收尾: 冒烟对账抗列表缓存滞后 + 实盘初始资金 env 覆盖
+
+- `live/smoke.py`：撤单确认后对挂单列表做**有限重读**（`--open-orders-attempts` 默认 3 ×
+  `--open-orders-interval` 默认 5s；函数参数 `open_orders_attempts`/`open_orders_sleep`），
+  新增 `await_no_open_orders()` 把四种结局分开：列表在重读中清空（若确曾滞后 → 记
+  `open_orders_check.note = cancel_confirmed_but_list_lag` 供人工确认，**不报** residual risk）；
+  撤单已确认但重读后**仍只显示该 id** → `cancel_confirmed_but_list_still_shows_order`（真残留风险，
+  原因明确）；列表出现**别的** id → `other_orders_remain`；撤单未确认仍见挂单 → `open_orders_remain`。
+  人类摘要与审计新增 `open_orders` 步骤（含 attempts/remaining/note）。
+- `_r_state.load_config`：新增**第四个**环境变量覆盖 `YES2RE_INITIAL_CAPITAL_USDC=<正数>` →
+  `cfg['paper_initial_capital_usdc']`（实盘实例用它把账本初始资金对齐真实账户余额，
+  使 live 侧"当前权益"以真实资金起算）。缺省/空串 ⇒ 不覆盖（输出与改动前**逐字段一致**，
+  由改动前 golden 全量比对守住）；非法值（非数字/≤0/`NaN`/`inf`）⇒ `SystemExit` 并报出变量名
+  （fail-closed）；覆盖仍在校验之前、`mode` 安全锁与策略参数不受影响。
+- 文档：`live/README.md`（env 表新增一行 + 实盘账本起点说明 + 失败处置表新增两行）、
+  `DEPLOY_RUNBOOK.md`（§7.2 单元示例与 §7.3.1 差异面表新增该变量）。
+- 测试：`tests_live.py` **50/50**、`tests_port.py` **16/16**（含新增：列表滞后两次后清空不报残留、
+  持续显示该 id 必报残留且原因明确、别的 id 立即报残留、`await_no_open_orders()` 五分支；
+  `YES2RE_INITIAL_CAPITAL_USDC` 生效/非法 fail-closed/未设置逐字段一致/账本初始化）。
+- paper 回归：5 套件对基线**逐行 diff 为空**。
+
 ## 2026-09-10 — Phase 3b-3: live 层剩余工具统一迁到 CLOB v2（v1 全废弃）
 
 - **背景**：Phase 3b 只把新的 `v2_transport` 迁到 `py-clob-client-v2`，旧工具仍 `import py_clob_client`（v1）

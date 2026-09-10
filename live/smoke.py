@@ -45,6 +45,10 @@ DEFAULT_BUDGET_USDC = "5"
 TICK_GAP = 2                      # place this many ticks below the best bid
 POLL_ATTEMPTS = 6
 POLL_SLEEP_SECONDS = 1.0
+#: after a *confirmed* cancel the CLOB open-order list can lag a few seconds; re-read it a few
+#: times before crying "residual risk" (real money is not at stake, but false alarms are)
+OPEN_ORDERS_ATTEMPTS = 3
+OPEN_ORDERS_SLEEP_SECONDS = 5.0
 CONFIRMED_STATUSES = ("live", "unmatched", "open", "delayed")
 FILLED_STATUSES = ("matched", "filled", "partially_filled", "partial")
 CANCELLED_STATUSES = ("cancelled", "canceled")
@@ -197,6 +201,58 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+def await_no_open_orders(client, order_id, *, cancel_confirmed: bool,
+                         attempts: int = OPEN_ORDERS_ATTEMPTS,
+                         sleep_seconds: float = OPEN_ORDERS_SLEEP_SECONDS,
+                         sleep=None) -> dict:
+    """Read the live open-order list until our (cancelled) order is gone.
+
+    The CLOB list endpoint is cached and can lag a confirmed cancel by a few seconds, so a single
+    read is not evidence. Distinguishes:
+
+    * the list clears (possibly only after a retry) ⇒ ``ok``; a lag that needed a retry is
+      recorded as ``cancel_confirmed_but_list_lag`` for humans (never as residual risk);
+    * the list only ever shows **our** cancelled id and never clears ⇒
+      ``cancel_confirmed_but_list_still_shows_order`` (residual risk, needs a human look);
+    * the list shows **another** order id ⇒ ``other_orders_remain`` (residual risk);
+    * not confirmed cancelled and orders remain ⇒ ``open_orders_remain`` (residual risk).
+    """
+    sleep = sleep or _sleep
+    attempts = max(1, int(attempts))
+    seen: list[list[str]] = []
+    for attempt in range(1, attempts + 1):
+        try:
+            listed = submit.list_open_orders(client)
+        except Exception as exc:  # noqa: BLE001 - cannot confirm ⇒ fail closed
+            return {"ok": False, "status": "list_failed", "attempts": attempt,
+                    "remaining_ids": seen[-1] if seen else [],
+                    "detail": f"{type(exc).__name__}: {exc}", "lag_observed": False, "note": ""}
+        ids = [str(row.get("id")) for row in (listed.get("orders") or [])]
+        seen.append(ids)
+        if not ids:
+            lagged = attempt > 1
+            return {"ok": True, "status": "clear", "attempts": attempt, "remaining_ids": [],
+                    "lag_observed": lagged,
+                    "note": ("cancel_confirmed_but_list_lag"
+                             if (lagged and cancel_confirmed) else "")}
+        if order_id and str(order_id) not in ids:
+            return {"ok": False, "status": "other_orders_remain", "attempts": attempt,
+                    "remaining_ids": ids, "lag_observed": False, "note": "",
+                    "detail": f"open orders not ours: {ids}"}
+        if attempt < attempts and sleep_seconds:
+            sleep(sleep_seconds)
+    remaining = seen[-1] if seen else []
+    if cancel_confirmed and order_id and remaining and all(str(i) == str(order_id) for i in remaining):
+        return {"ok": False, "status": "cancel_confirmed_but_list_still_shows_order",
+                "attempts": attempts, "remaining_ids": remaining, "lag_observed": True,
+                "note": "cancel_confirmed_but_list_lag",
+                "detail": f"cancel of {order_id} was confirmed but the open-order list still "
+                          f"shows it after {attempts} read(s) — confirm by hand"}
+    return {"ok": False, "status": "open_orders_remain", "attempts": attempts,
+            "remaining_ids": remaining, "lag_observed": len(remaining) > 0,
+            "detail": f"open orders remain after {attempts} read(s): {remaining}"}
+
+
 def rescue_cancel(client, *, order_id, token_id=None, price=None) -> dict:
     """Best-effort cleanup after a failure: cancel by id, else cancel matching orders.
 
@@ -255,6 +311,7 @@ def _report_skeleton(env: dict, *, budget: str, scenario: bool) -> dict:
         "budget_usdc": budget, "gates": None, "sentinel": None, "market": None, "book": None,
         "plan": None, "risk_gate": None, "limits_check": None, "non_marketable": None,
         "selection": None, "bucket_attempts": [], "bucket_rejected": [],
+        "open_orders_check": None,
         "order": {"order_id": None, "submitted": False, "confirmed": None, "cancelled": None},
         "reconcile": None, "residual_risk": False, "steps": [],
     }
@@ -495,7 +552,9 @@ def run_smoke(*, enable_submit: bool = False, confirm: str | None = None,
               budget_usdc: str = DEFAULT_BUDGET_USDC, env: dict | None = None,
               city=None, local_date=None, direction=None, token_id=None,
               price_override=None, timeout: int = 25, sleep=None, attempts: int = POLL_ATTEMPTS,
-              reconcile_fn=None, readonly: bool = False, leg: str = "buy_yes") -> dict:
+              reconcile_fn=None, readonly: bool = False, leg: str = "buy_yes",
+              open_orders_attempts: int = OPEN_ORDERS_ATTEMPTS,
+              open_orders_sleep: float = OPEN_ORDERS_SLEEP_SECONDS) -> dict:
     """Run the smoke loop. Never raises — every failure is logged and fail-closed."""
     env = env if env is not None else creds_mod.load_env_file()
     reconcile_fn = reconcile_fn or reconcile.collect
@@ -720,17 +779,35 @@ def run_smoke(*, enable_submit: bool = False, confirm: str | None = None,
             elif not report["reason"].startswith("unexpected_fill"):
                 report["reason"] = report["reason"] or "unexpected_fill"
 
-        # ⑧ reconcile: no open orders may remain
+        # ⑧ no open orders may remain — a confirmed cancel can lag the list endpoint, so re-read
+        #    it a bounded number of times instead of crying "residual risk" on one stale page
+        cancel_confirmed = bool((report["order"].get("confirmed") or {}).get("ok")
+                                and report["order"].get("status_after_cancel") in CANCELLED_STATUSES)
+        check = await_no_open_orders(client, order_id, cancel_confirmed=cancel_confirmed,
+                                     attempts=open_orders_attempts,
+                                     sleep_seconds=open_orders_sleep, sleep=sleep)
+        report["open_orders_check"] = check
+        step("open_orders", check["status"],
+             response_summary={k: check[k] for k in ("status", "attempts", "remaining_ids", "note")},
+             order_id=order_id)
         final = reconcile_fn(env)
         report["reconcile"] = {key: final.get(key) for key in
                                ("ok", "open_orders", "usdc_balance", "positions_value_usdc")}
         step("reconcile", "ok" if final.get("open_orders") == 0 else "open_orders_remain",
              response_summary=report["reconcile"])
-        if final.get("open_orders"):
+        if not check["ok"]:
             report["ok"] = False
-            report["reason"] = "open_orders_remain"
+            report["reason"] = check["status"]
             report["exit_code"] = 2
             report["residual_risk"] = True
+        elif final.get("open_orders"):
+            # the id list said "clear" but the snapshot still counts orders: trust the ids, note it
+            report["open_orders_check"]["snapshot_mismatch"] = final.get("open_orders")
+            if report["ok"]:
+                report["ok"] = True
+                step("complete", "ok", response_summary={"order_id": order_id,
+                                                         "snapshot_open_orders": final.get("open_orders")})
+            return report
         elif report["ok"]:
             step("complete", "ok", response_summary={"order_id": order_id})
         return report
@@ -848,6 +925,13 @@ def human_summary(report: dict) -> str:
     if order.get("order_id"):
         lines.append(f"order: id={order['order_id']} confirmed={(order.get('confirmed') or {}).get('status')} "
                      f"after_cancel={order.get('status_after_cancel')}")
+    check = report.get("open_orders_check") or {}
+    if check:
+        lines.append(f"open_orders check: {check.get('status')} "
+                     f"(attempts={check.get('attempts')}"
+                     + (f", lag={check['note']}" if check.get("note") else "")
+                     + (f", remaining={check.get('remaining_ids')}" if check.get("remaining_ids") else "")
+                     + ")")
     if report.get("reconcile"):
         lines.append(f"reconcile: open_orders={report['reconcile'].get('open_orders')}")
     if report.get("residual_risk"):
@@ -885,6 +969,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--timeout", type=int, default=25)
+    parser.add_argument("--open-orders-attempts", type=int, default=OPEN_ORDERS_ATTEMPTS,
+                        help="re-reads of the open-order list after a confirmed cancel")
+    parser.add_argument("--open-orders-interval", type=float, default=OPEN_ORDERS_SLEEP_SECONDS,
+                        help="seconds between those re-reads")
     args = parser.parse_args(argv)
 
     if args.dry_plan:
@@ -904,7 +992,9 @@ def main(argv: list[str] | None = None) -> int:
                        budget_usdc=args.budget_usdc, city=args.city, local_date=args.date,
                        direction=args.direction, token_id=args.token_id, leg=args.leg,
                        price_override=args.price, timeout=args.timeout,
-                       readonly=args.readonly_preflight)
+                       readonly=args.readonly_preflight,
+                       open_orders_attempts=args.open_orders_attempts,
+                       open_orders_sleep=args.open_orders_interval)
     try:
         out_path = Path(args.out)
         if out_path.parent != Path(""):

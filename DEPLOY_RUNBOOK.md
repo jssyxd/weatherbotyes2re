@@ -75,8 +75,11 @@ jq . data/yes2re_health.json
 
 ## 7. LIVE (CLOB v2) 部署与观测镜像 — Phase 3b
 
-> 状态：**未启用**。当前 my155 跑的是 `yes2re-paper`（`cfg["mode"]="paper"`）。以下为操作者
-> 拍板后切 live 的步骤与镜像观测方案；本仓库不改任何服务、不改 `.env`、不改 cron。
+> 状态：**已部署、观察模式（闸门未开，绝不下单）**。my155 上跑的是 `yes2re-live`
+> （`YES2RE_MODE=live`，端口闸门全未设 → 每次 fire 记 `fire_port_refused` 不开仓）；
+> 本机仍跑 `yes2re-paper` 作对照组。开启真实下单的精确步骤见 `ops/PENDING.md` §D-1。
+> 观测镜像实际实现 = `~/.hermes/scripts/live_mirror_sync.py`（一次 tar 取回 + 远端只读 reconcile），
+> 由 `live-observe.py`/`live_triage.py` 调用；`rsync` 仅为备选。本仓库不改任何服务/cron/`.env`。
 
 ### 7.1 前置事实
 
@@ -94,6 +97,9 @@ jq . data/yes2re_health.json
 #    两个实例的额度也用 env 区分（策略参数完全相同）：
 #      YES2RE_FIRE_BUDGET_USDC=<正数>        override cfg['fire_budget_usdc']
 #      YES2RE_MAX_OPEN_POSITIONS=<正整数>     override cfg['max_open_positions']
+#      YES2RE_INITIAL_CAPITAL_USDC=<正数>      override cfg['paper_initial_capital_usdc']
+#        ↑ 实盘实例填**真实账户余额**（如 51.713622）：账本初始资金以真实资金起算，
+#          镜像出的"当前权益"因此与真实余额同源（仅在新 state/无借记时用于初始化）
 # ② 服务侧三闸门（写进 systemd 单元，绝不写进 .env）
 #    Environment=YES2RE_LIVE_ENABLE_SUBMIT=1
 #    Environment=LIVE_SUBMIT_ENABLED=1
@@ -145,6 +151,7 @@ WantedBy=multi-user.target
 | `YES2RE_MODE` | `cfg['mode']` | `paper` \| `live`；非法值 → 启动即 `SystemExit`（fail-closed，不静默忽略） |
 | `YES2RE_FIRE_BUDGET_USDC` | `cfg['fire_budget_usdc']` | 每笔 fire 预算；有限正数 |
 | `YES2RE_MAX_OPEN_POSITIONS` | `cfg['max_open_positions']` | 同时持仓上限；正整数 |
+| `YES2RE_INITIAL_CAPITAL_USDC` | `cfg['paper_initial_capital_usdc']` | **实盘实例填真实账户余额**，使账本/权益以真实资金起算；有限正数 |
 
 未设置时 `load_config` 输出与改动前逐字段一致；覆盖后 `_validate_config`（间隔/金额/模式）照常校验。
 策略参数（`strategy` 子字典）**永远**来自共用的 config 文件，环境变量无法触及。

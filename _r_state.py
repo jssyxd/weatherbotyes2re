@@ -98,7 +98,10 @@ def _decode(obj: Any) -> Any:
 ENV_MODE = "YES2RE_MODE"
 ENV_FIRE_BUDGET = "YES2RE_FIRE_BUDGET_USDC"
 ENV_MAX_OPEN = "YES2RE_MAX_OPEN_POSITIONS"
-ENV_OVERRIDE_KEYS = (ENV_MODE, ENV_FIRE_BUDGET, ENV_MAX_OPEN)
+#: live instances seed the ledger with the *real* account balance so "current equity" starts
+#: from real money (the paper instance keeps the config value)
+ENV_INITIAL_CAPITAL = "YES2RE_INITIAL_CAPITAL_USDC"
+ENV_OVERRIDE_KEYS = (ENV_MODE, ENV_FIRE_BUDGET, ENV_MAX_OPEN, ENV_INITIAL_CAPITAL)
 _VALID_MODES = ("paper", "live")
 
 
@@ -135,6 +138,15 @@ def _env_overrides(env: dict[str, str] | None = None) -> dict[str, Any]:
         if not text.lstrip("+").isdigit() or int(text) <= 0:
             raise SystemExit(f"env {ENV_MAX_OPEN}={raw_max!r}: must be a positive integer")
         applied["max_open_positions"] = int(text)
+    raw_capital = src.get(ENV_INITIAL_CAPITAL)
+    if raw_capital is not None and str(raw_capital).strip() != "":
+        try:
+            capital = float(str(raw_capital).strip())
+        except (TypeError, ValueError):
+            raise SystemExit(f"env {ENV_INITIAL_CAPITAL}={raw_capital!r}: not a number") from None
+        if not math.isfinite(capital) or capital <= 0:
+            raise SystemExit(f"env {ENV_INITIAL_CAPITAL}={raw_capital!r}: must be a finite positive number")
+        applied["paper_initial_capital_usdc"] = capital
     return {"applied": applied, "mode_explicit": "mode" in applied,
             "keys": [k for k in ENV_OVERRIDE_KEYS if k in src and str(src.get(k) or "").strip() != ""]}
 
@@ -144,11 +156,12 @@ def load_config(path: str | os.PathLike, *, env: dict[str, str] | None = None) -
     :data:`DEFAULTS`. The ``strategy`` sub-dict is merged shallowly with the
     strategy module defaults at call time (see ``reversal_strategy``).
 
-    Deployment overrides come from the environment (``env=None`` ⇒ ``os.environ``):
-    only ``mode`` / ``fire_budget_usdc`` / ``max_open_positions`` can differ between the
-    paper and live instances — every strategy parameter stays exactly as the shared
-    config file says. Without those variables the returned dict is bit-for-bit what it
-    always was.
+    Deployment overrides come from the environment (``env=None`` ⇒ ``os.environ``): only
+    ``mode`` / ``fire_budget_usdc`` / ``max_open_positions`` / ``paper_initial_capital_usdc``
+    can differ between the paper and live instances — every strategy parameter stays exactly as
+    the shared config file says. The live instance sets ``YES2RE_INITIAL_CAPITAL_USDC`` to the
+    real account balance so the ledger (and therefore the reported current equity) starts from
+    real money. Without those variables the returned dict is bit-for-bit what it always was.
     """
     cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
     p = Path(path)

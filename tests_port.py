@@ -791,8 +791,13 @@ def test_load_config_env_overrides():
         ({"YES2RE_FIRE_BUDGET_USDC": "1e1"}, {"fire_budget_usdc": 10.0}),
         ({"YES2RE_MAX_OPEN_POSITIONS": "3"}, {"max_open_positions": 3}),
         ({"YES2RE_MAX_OPEN_POSITIONS": "+4"}, {"max_open_positions": 4}),
-        ({"YES2RE_MODE": "live", "YES2RE_FIRE_BUDGET_USDC": "12", "YES2RE_MAX_OPEN_POSITIONS": "10"},
-         {"mode": "live", "fire_budget_usdc": 12.0, "max_open_positions": 10}),
+        ({"YES2RE_INITIAL_CAPITAL_USDC": "1234.56"},
+         {"paper_initial_capital_usdc": 1234.56}),
+        ({"YES2RE_INITIAL_CAPITAL_USDC": "500"}, {"paper_initial_capital_usdc": 500.0}),
+        ({"YES2RE_MODE": "live", "YES2RE_FIRE_BUDGET_USDC": "12", "YES2RE_MAX_OPEN_POSITIONS": "10",
+          "YES2RE_INITIAL_CAPITAL_USDC": "51.713622"},
+         {"mode": "live", "fire_budget_usdc": 12.0, "max_open_positions": 10,
+          "paper_initial_capital_usdc": 51.713622}),
     ]
     for env, expected in cases:
         with contextlib.redirect_stderr(io.StringIO()):
@@ -805,7 +810,8 @@ def test_load_config_env_overrides():
 
     # (2) empty/absent values are ignored (not an override, not an error)
     for env in ({}, {"YES2RE_MODE": ""}, {"YES2RE_MODE": "   "},
-                {"YES2RE_FIRE_BUDGET_USDC": ""}, {"YES2RE_MAX_OPEN_POSITIONS": ""}):
+                {"YES2RE_FIRE_BUDGET_USDC": ""}, {"YES2RE_MAX_OPEN_POSITIONS": ""},
+                {"YES2RE_INITIAL_CAPITAL_USDC": ""}):
         assert _r_state.load_config("config/yes2re_reversal.json", env=env) == GOLDEN_CONFIG, env
 
     # (3) illegal values fail closed with a message naming the variable
@@ -821,6 +827,11 @@ def test_load_config_env_overrides():
         ({"YES2RE_MAX_OPEN_POSITIONS": "-2"}, "YES2RE_MAX_OPEN_POSITIONS"),
         ({"YES2RE_MAX_OPEN_POSITIONS": "2.5"}, "YES2RE_MAX_OPEN_POSITIONS"),
         ({"YES2RE_MAX_OPEN_POSITIONS": "many"}, "YES2RE_MAX_OPEN_POSITIONS"),
+        ({"YES2RE_INITIAL_CAPITAL_USDC": "0"}, "YES2RE_INITIAL_CAPITAL_USDC"),
+        ({"YES2RE_INITIAL_CAPITAL_USDC": "-5"}, "YES2RE_INITIAL_CAPITAL_USDC"),
+        ({"YES2RE_INITIAL_CAPITAL_USDC": "abc"}, "YES2RE_INITIAL_CAPITAL_USDC"),
+        ({"YES2RE_INITIAL_CAPITAL_USDC": "NaN"}, "YES2RE_INITIAL_CAPITAL_USDC"),
+        ({"YES2RE_INITIAL_CAPITAL_USDC": "inf"}, "YES2RE_INITIAL_CAPITAL_USDC"),
     ]
     for env, key in bad:
         try:
@@ -860,9 +871,21 @@ def test_load_config_env_overrides():
         assert cfg["strategy"] == GOLDEN_STRATEGY
         assert _r_state._env_overrides()["mode_explicit"] is True
     assert _r_state.ENV_OVERRIDE_KEYS == ("YES2RE_MODE", "YES2RE_FIRE_BUDGET_USDC",
-                                          "YES2RE_MAX_OPEN_POSITIONS")
+                                          "YES2RE_MAX_OPEN_POSITIONS",
+                                          "YES2RE_INITIAL_CAPITAL_USDC")
     assert _r_state.load_config("config/yes2re_reversal.json") == GOLDEN_CONFIG, \
         "os.environ must be back to normal after the patch"
+
+    # (5b) the live instance aligns the ledger with the real balance: a *fresh* state seeds the
+    #      ledger from cfg, so "current equity" starts from real money
+    with contextlib.redirect_stderr(io.StringIO()):
+        live_cfg = _r_state.load_config("config/yes2re_reversal.json",
+                                        env={"YES2RE_MODE": "live",
+                                             "YES2RE_INITIAL_CAPITAL_USDC": "51.713622"})
+    assert live_cfg["paper_initial_capital_usdc"] == 51.713622, live_cfg["paper_initial_capital_usdc"]
+    assert live_cfg["strategy"] == GOLDEN_STRATEGY, "capital override must not touch strategy"
+    assert _r_state._blank_state(live_cfg)["paper_initial_capital_usdc"] == 51.713622
+    assert _r_state._blank_state(GOLDEN_CONFIG)["paper_initial_capital_usdc"] == 600.0
 
     # (6) selecting live from the environment is announced on stderr (visible in the journal)
     captured = io.StringIO()
