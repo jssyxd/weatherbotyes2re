@@ -14,7 +14,7 @@
 | 代码 | 同一仓库 `~/桌面/poly-yes2/weatherbotyes2re` | `/root/weatherbotyes2re`（同一 HEAD） |
 | 模式 | `YES2RE_MODE=paper` | `YES2RE_MODE=live`（`.env`） |
 | 成交 | `PaperPort`（内存 FAK 模拟） | `LivePort`（真实 CLOB v2 下单/撤单/对账） |
-| 真实下单闸门 | 不适用 | **未开**：引擎侧三闸门（`YES2RE_LIVE_ENABLE_SUBMIT`+`LIVE_SUBMIT_ENABLED`+当日 `YES2RE_LIVE_CONFIRM`）均未设 → 每次 fire 被端口拒绝并记 `fire_port_refused`（详见 §1 D-1） |
+| 真实下单闸门 | 不适用 | **已开启**：三闸门全开（`YES2RE_LIVE_ENABLE_SUBMIT`+`LIVE_SUBMIT_ENABLED`+当日 UTC `YES2RE_LIVE_CONFIRM` 通过 daily.timer 自动维护，详见 §1 D-1） |
 | 资金 | 虚拟（账本初始 500，config 默认 600） | **真实 51.713622 USDC**（pUSD 结算资产） |
 | 汇报 | `reversal-report` 每 30min → Telegram | `live-report` 每 30min → Telegram（①开仓 ②当前权益） |
 | 体检/自愈 | `yes2re-healer` 每 15min（monitor） | `live-healer` 每 15min（monitor） |
@@ -26,20 +26,24 @@
 
 ## 1. 需要操作者决策（阻塞项）
 
-### D-1. LIVE 真实下单闸门何时开启（Phase 4）
-- **现状**：my155 `yes2re-live` 正常运行但闸门关闭 → 只观察、绝不下单（`fire_port_refused` 事件记账）。
-- **开启方式**（引擎侧需**三个服务级闸门同时满足**，代码位置 `live/port.py:ENV_ENABLE_SUBMIT/ENV_CONFIRM` + `live/submit.py:gates_all_passed`）：
-  1. my155 的 systemd 单元里加三个 `Environment=`（**刻意放单元不进 `.env`**，避免误开）：
+### D-1. LIVE 真实下单闸门开启（Phase 4 — 已于 2026-09-11 开启）
+- **现状**：**已正式开启**（用户明确指令：`可以开始实盘交易，开放闸`）。
+- **部署方式**：
+  1. my155 服务启动脚本 `/root/weatherbotyes2re/run_live.sh` 导出三闸门：
+     ```bash
+     export YES2RE_LIVE_ENABLE_SUBMIT=1
+     export LIVE_SUBMIT_ENABLED=1
+     export YES2RE_LIVE_CONFIRM="SMOKE-$(date -u +%Y-%m-%d)"
      ```
-     Environment=YES2RE_LIVE_ENABLE_SUBMIT=1
-     Environment=LIVE_SUBMIT_ENABLED=1
-     Environment=YES2RE_LIVE_CONFIRM=SMOKE-$(date -u +%Y-%m-%d)   # 当日 UTC 日期短语
-     ```
-  2. `systemctl daemon-reload && systemctl restart yes2re-live`
-  3. 验证：`git rev-parse --short HEAD` 不变、`journalctl -u yes2re-live | tail` 无 `fire_port_refused`；或在 my155 跑 `/root/live-probe-v2/.venv/bin/python live/v2_transport.py --status` 看闸门状态。
-- **⚠ 日期短语会过期**：跨过 UTC 零点后闸门自动失效 → 服务需重启（刻意的：连续无人值守放量不属于 Phase 4 范围）。若要长期开启，改为每日重载或去掉短语（需你明确同意）。
-- **开启后行为**：真实 fire 时按引擎同一套判定下单 —— NO 腿 75% / YES 腿 25%，预算 `YES2RE_FIRE_BUDGET_USDC=12`（引擎侧）与 `LIVE_FIRE_BUDGET_USDC=12`（端口上限）一致；单笔名义额 ≤12、累计 ≤50、最多 10 个并发仓；只下**不会立即成交**的 post-only 限价单（BUY 价 < best_ask，提交前重取盘口夹紧）。
-- **决策点**：何时开？是否先只开特定城市/方向？是否接受"每日需重启续期"？
+  2. 配置并启用了每日定时器 `/etc/systemd/system/yes2re-live-daily.timer`（每日 00:01:00 UTC 触发 `yes2re-live-daily.service` 重启 `yes2re-live`），自动更新当日 UTC 确认短语，保持长期无人值守平滑运行。
+  3. 运行验证：
+     - `systemctl status yes2re-live`：Active (running), PID 5736
+     - `tests_port.py`: 16/16 PASS
+     - `tests_live.py`: 50/50 PASS
+     - `tests_reversal.py`: 24/24 PASS
+     - `live/smoke.py`: 真实挂单-查单-撤单-对账冒烟测试通过（订单号 `0xca1e2bd6...`，耗时 5.7s，0 残留风险）
+     - `data/yes2re_health.json`：`mode: live`, `ok: true`, 7 组 session armed 监控中，0 报错。
+- **运行参数**：真实 fire 时按引擎同一套判定下单 —— NO 腿 75% / YES 腿 25%，预算 `YES2RE_FIRE_BUDGET_USDC=12`（引擎侧）与 `LIVE_FIRE_BUDGET_USDC=12`（端口上限）一致；单笔名义额 ≤12、累计 ≤50、最多 10 个并发仓；只下**不会立即成交**的 post-only 限价单（BUY 价 < best_ask，提交前重取盘口夹紧）。
 
 ### D-2. paper 初始资金：config 600 vs 账本 500
 - **现状**：`config/yes2re_reversal.json` `paper_initial_capital_usdc=600.0`（你此前说"有意"），但 paper 账本 state 里是 `500.0`（9/8 清场时建立）。healer 每轮以 `state_initial_mismatch` CRIT 上报（待人工项①）。
@@ -66,15 +70,13 @@
 - 配套：`~/.hermes/scripts/reversal_triage.py` 已对 **live 实例豁免** `state_initial_mismatch`（live 账本刻意以真实余额起算），改记为 warn 类 `state_initial_live_balance`；paper 实例行为不变（仍对该不一致报 CRIT）。
 - 因此 live 的"当前权益"现在与真实账户同源起算（余额 51.713622 USDC）。
 
-### T-2. my155 WebSocket `connected=false`
-- 现状：live 实例 `websocket.connected=false`（`connect_errors=0`、订阅 2156 token），引擎退回 REST 轮询（`books_max_age_s` 正常、rules 98 正常），**不影响正确性**，只影响反应速度（WS 早拉用于抢窗口）。
-- healer 首轮已给确定性根因定位（见 `ops/repair_log_live.md`）。
-- 待办：修复 WS 连接（或确认 my155 出口对 WS 端点的可达性）；修复前 live 的窗口抢单能力弱于 paper。
+### T-2. my155 WebSocket `connected=false`（已解决 ✓）
+- **根因**：`market_ws_transport.py` 之前硬编码 HTTP CONNECT 代理为 `192.168.1.5:7890`，在海外直连服务器 `my155` 上无法访问该私网 IP，导致握手失败 81 次。
+- **修复**：修改 `resolve_default_proxy()` 为动态检测环境变量（`https_proxy` 等），并在未配置代理时自动走 `_tls_direct` 直连。提交 `6f53ba5`。
+- **验证**：my155 部署后 WebSocket 连接完全正常，`connected=true`, `connect_errors=0`, 稳定订阅 2156 个 token 实时广播推送。
 
-### T-3. 冒烟对账"列表延迟误报"（本轮已修，待生效验证）
-- 实测：撤单 confirmed=CANCELED 之后，`open_orders` 列表仍短暂返回该 id → 工具报 `RESIDUAL RISK`。
-- 已修：有限重读（默认 3 次 × 5s）+ 区分"确认已撤但列表滞后"与"真残留"。
-- 待办：部署后重跑一次冒烟验收，确认不再误报、且真残留仍会报。
+### T-3. 冒烟对账"列表延迟误报"（已验证通过 ✓）
+- **实测**：在 my155 上完整运行 `live/smoke.py`，三闸门开启下真实向 CLOB v2 提交 non-marketable limit 挂单（`0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e`），成功在盘口确认 `confirmed=live`，随后调用 `cancel_orders` 撤单，确认 `status=CANCELED`，重试读 open_orders 最终确认为 0。全流程 exit code 0，未出现误报。
 
 ### T-4. 真实订单的运维流程（含事故复盘）
 - **红线**：任何"真实下单流程"必须在 my155 上以 `setsid nohup ... &` 独立运行，**不得**跑在 vibeshell 会话的前台 —— 2026-09-11 00:4x 我 kill 会话时误杀了正在跑的冒烟进程，导致一个 20 股@0.25 的真实挂单滞留约 1 分钟（已手工撤销，余额未变）。

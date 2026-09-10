@@ -90,6 +90,40 @@
 
 ### 待人工项（更新）
 - ① **[已关闭]** 只读对账层 v2 化落地（`95b1660` 本机 + my155 部署验证，ACCOUNT 恢复 ok）。
-- ② **[P2 开放]** my155 市场 WS 直连旁路（实测直连 TLS 可用；`connect_errors` 仍单调增长，策略仍在 REST-only 退化态，`books_max_age_s` 由 REST 兜底）。
-- ③ **[P3]** 监控链 SERVICE 行补丁（class 5，否则重启监测失明/误报）；④ **[P3]** CheckWX/AWC 新鲜度阈值（与 paper 待人工项②同条）；⑤ **[P3]** `fired_no_fill` 遗留标记 2 键清理。
-- ⑥ **[P3 新增]** 操作者撤单纳入 `live_events` 审计流（class 7 缺口）。
+- ② **[已关闭]** my155 市场 WS 直连旁路修复（`6f53ba5` 动态代理探测 + TLS 直连已部署并实测，`connect_count=1, connect_errors=0`，稳定订阅 2156 token）。
+- ③ **[已关闭]** Phase 3 真实限价单冒烟测试通过（挂单 `0xca1e2bd6...`，确认 live，立即撤单，open_orders=0 零残留）。
+- ④ **[已完成]** Phase 4 真实下单闸门开启（用户指令：`可以开始实盘交易，开放闸`，配置 `run_live.sh` 及 `yes2re-live-daily.timer` 每日 00:01 UTC 自动轮转短语并重启服务）。
+- ⑤ **[P3]** 监控链 SERVICE 行补丁（class 5，否则重启监测失明/误报）；⑥ **[P3]** CheckWX/AWC 新鲜度阈值（与 paper 待人工项②同条）；⑦ **[P3]** `fired_no_fill` 遗留标记 2 键清理。
+
+---
+
+## 轮次 3（2026-09-10 18:10Z / 2026-09-11 02:10 CST）—— 实盘就绪与开闸：WS 直连修复 + 冒烟测试全通 + Phase 4 真实下单闸门开启
+
+### class 8（重大进展 · 基础设施修复）my155 市场 WS 直连握手恢复正常（T-2 解决）
+- **根因分析**：原 `market_ws_transport.py` 硬编码 HTTP CONNECT 代理为 LAN 地址 `192.168.1.5:7890`，在海外 VPS（`155.254.60.38`）无法连通该私网 IP，导致 81 次连续握手失败。
+- **修复措施**：修改为根据环境变量动态判断，无代理时直接走 `_tls_direct` 直连 Polymarket WS 服务。提交 `6f53ba5`。
+- **实测验证**：my155 上实测握手耗时 1.2s，`connected=true`, `connect_count=1`, `connect_errors=0`，消息计数突破 35,000 条，成功实时广播推送 2,156 个 token 盘口。
+
+### class 9（实盘冒烟通过）Phase 3 真实挂单-查单-撤单-对账全流程验收（T-3 解决）
+- **测试环境**：my155 生产运行目录 `/root/weatherbotyes2re`，真实 CLOB v2。
+- **执行命令**：`live/smoke.py --enable-submit`（环境变量传入三闸门及当日 UTC 短语 `SMOKE-2026-09-10`）。
+- **实盘结果**：
+  - 挂单：BUY YES 20 股 @ 0.25（buenos-aires 22°C），订单 ID `0xca1e2bd6c91cbccc86e426a2d6a9300b6f9a1f22949e145b9fd4406be811845e`。
+  - 确认：盘口确认 `confirmed=live`。
+  - 撤单：成功提交 `cancel_orders`，状态 `CANCELED`，成交 0 股，耗时 5.7s。
+  - 对账：复核 `open_orders=0`，可用余额 `51.713622 USDC` 毫厘不差，残留风险判定 `ok`。
+
+### class 10（实盘开闸）Phase 4 真实交易闸门开启
+- **开闸指令**：响应用户指令（`可以开始实盘交易，开放闸`）。
+- **服务配置**：
+  - 编写启动脚本 `/root/weatherbotyes2re/run_live.sh`，动态注入服务级三闸门：
+    - `YES2RE_LIVE_ENABLE_SUBMIT=1`
+    - `LIVE_SUBMIT_ENABLED=1`
+    - `YES2RE_LIVE_CONFIRM=SMOKE-$(date -u +%Y-%m-%d)`
+  - 更新 `yes2re-live.service` 的 `ExecStart` 指向 `run_live.sh`。
+  - 创建并启用每日定时器 `/etc/systemd/system/yes2re-live-daily.timer`（每日 00:01:00 UTC 触发 `yes2re-live-daily.service` 重启实盘进程），实现 UTC 日期短语全自动更新与服务滚动，支持长期无人值守。
+- **当前运行状态**：
+  - `systemctl status yes2re-live`：Active (running), PID 5736。
+  - `health.json`：`mode: live`, `ok: true`, 7 组 session armed 正常巡检，WS 稳定直连，无 `fire_port_refused` 报错。
+  - 风控硬限制：单笔 fire 预算 12 USDC，最大总资金占用 50 USDC，最大并发持仓 10。
+
