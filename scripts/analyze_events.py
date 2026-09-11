@@ -96,7 +96,7 @@ def main():
         city_icao = {}
         if CITIES_PATH.exists():
             with open(CITIES_PATH, "r", encoding="utf-8") as cf:
-                city_icao = {c["city_id"]: c.get("station", {}).get("icao") for c in json.load(cf)}
+                city_icao = {c["city_id"]: c.get("icao") for c in json.load(cf)}
 
         for k, v in armed.items():
             cid = k.split("|")[0]
@@ -105,7 +105,8 @@ def main():
             obs = metar_tel.get(icao, {})
             temp_c = obs.get("temp_c")
             ref = v.get("ref_extreme")
-            print(f"  {k:30s} | icao={icao:4s} | current_temp={str(temp_c):5s}°C | ref={str(ref):5s} | dir={direction}")
+            icao_str = str(icao or "")
+            print(f"  {k:30s} | icao={icao_str:4s} | current_temp={str(temp_c):5s}°C | ref={str(ref):5s} | dir={direction}")
 
 
 if __name__ == "__main__":
