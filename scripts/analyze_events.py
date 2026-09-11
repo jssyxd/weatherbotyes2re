@@ -113,15 +113,16 @@ def main():
         for k, v in pos.items():
             print(f"  {k}: {json.dumps(v, indent=2)}")
 
-    print("\n--- Non-duplicate Events for Toronto ---")
+    print("\n--- Non-duplicate Events for Shenzhen ---")
     with open(EVENTS_PATH, "r", encoding="utf-8") as f:
         for line in f:
-            if "toronto|2026-09-11|low" in line and "duplicate" not in line:
-                print(f"  {line.strip()[:250]}")
+            if "shenzhen|2026-09-11|high" in line and "duplicate" not in line:
+                print(f"  {line.strip()[:300]}")
 
 
 if __name__ == "__main__":
     main()
+
 
 
 
