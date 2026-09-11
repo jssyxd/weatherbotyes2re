@@ -73,7 +73,24 @@ def main():
 
     print(f"\n--- Firing Events ({len(firings)}) ---")
     for f in firings:
-        print(f"  {f}")
+        t = f.get("type")
+        k = f.get("key")
+        ts = f.get("ts_utc")
+        print(f"  [{ts}] {t:12s} {k}")
+        if t == "fire":
+            fills = f.get("fills", {})
+            print(f"    fills: {fills}")
+            ladder = f.get("ladder", [])
+            for rung in ladder:
+                r_leg = rung.get("leg")
+                r_st = rung.get("status")
+                r_note = rung.get("note")
+                r_ask = rung.get("best_ask")
+                r_cap = rung.get("cap")
+                r_fl = rung.get("floor")
+                r_ms = rung.get("elapsed_ms")
+                print(f"    rung @{r_ms}ms: leg={r_leg} status={r_st} ask={r_ask} floor={r_fl} cap={r_cap} note={r_note}")
+
 
     STATE_PATH = ROOT / "data" / "yes2re_state.json"
     if STATE_PATH.exists():
