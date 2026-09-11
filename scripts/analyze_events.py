@@ -85,10 +85,30 @@ def main():
             print(f"  {k:35s}: {v}")
         armed = st.get("weatherbotyes2re", {}).get("armed", {})
         print(f"\n--- Currently Armed in State Blob ({len(armed)}) ---")
+        HEALTH_PATH = ROOT / "data" / "yes2re_health.json"
+        metar_tel = {}
+        if HEALTH_PATH.exists():
+            with open(HEALTH_PATH, "r", encoding="utf-8") as hf:
+                metar_tel = json.load(hf).get("feed", {}).get("metar", {}).get("per_icao", {})
+
+        # Load contract_cities.json to map city -> icao
+        CITIES_PATH = ROOT / "config" / "contract_cities.json"
+        city_icao = {}
+        if CITIES_PATH.exists():
+            with open(CITIES_PATH, "r", encoding="utf-8") as cf:
+                city_icao = {c["city_id"]: c.get("station", {}).get("icao") for c in json.load(cf)}
+
         for k, v in armed.items():
-            print(f"  {k:35s}: taf_bucket={v.get('taf_bucket_id')} ref={v.get('ref_extreme')}")
+            cid = k.split("|")[0]
+            direction = k.split("|")[2] if len(k.split("|")) > 2 else ""
+            icao = city_icao.get(cid, "")
+            obs = metar_tel.get(icao, {})
+            temp_c = obs.get("temp_c")
+            ref = v.get("ref_extreme")
+            print(f"  {k:30s} | icao={icao:4s} | current_temp={str(temp_c):5s}°C | ref={str(ref):5s} | dir={direction}")
 
 
 if __name__ == "__main__":
     main()
+
 
