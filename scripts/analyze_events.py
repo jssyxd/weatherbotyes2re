@@ -53,9 +53,28 @@ def main():
     for k, v in arm_keys.most_common(10):
         print(f"  {k:30s}: {v}")
 
+    print("\n--- Candidate Breaches (Consensus Filtered or Non-Jump-1) ---")
+    with open(EVENTS_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+                if ev.get("type") == "skip" and ev.get("reason") in (
+                    "consensus_filter", "jump_must_be_one", "already_fired",
+                    "break_not_confirmed", "break_without_arm"
+                ):
+                    key = ev.get("key")
+                    reason = ev.get("reason")
+                    jump = ev.get("jump")
+                    cons = (ev.get("consensus") or {}).get("reason")
+                    ts = ev.get("ts_utc")
+                    print(f"  {ts} | {key:30s} | {reason:20s} | jump={str(jump):5s} | cons={str(cons)}")
+            except Exception:
+                pass
+
     print(f"\n--- Firing Events ({len(firings)}) ---")
     for f in firings:
         print(f"  {f}")
+
 
 if __name__ == "__main__":
     main()
