@@ -108,8 +108,14 @@ def main():
             icao_str = str(icao or "")
             print(f"  {k:30s} | icao={icao_str:4s} | current_temp={str(temp_c):5s}°C | ref={str(ref):5s} | dir={direction}")
 
+        pos = st.get("positions", {})
+        print(f"\n--- Open Positions in State Blob ({len(pos)}) ---")
+        for k, v in pos.items():
+            print(f"  {k}: {json.dumps(v, indent=2)}")
+
 
 if __name__ == "__main__":
     main()
+
 
 
