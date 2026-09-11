@@ -75,6 +75,20 @@ def main():
     for f in firings:
         print(f"  {f}")
 
+    STATE_PATH = ROOT / "data" / "yes2re_state.json"
+    if STATE_PATH.exists():
+        with open(STATE_PATH, "r", encoding="utf-8") as sf:
+            st = json.load(sf)
+        fired = st.get("weatherbotyes2re", {}).get("fired", {})
+        print(f"\n--- Fired Keys in State Blob ({len(fired)}) ---")
+        for k, v in fired.items():
+            print(f"  {k:35s}: {v}")
+        armed = st.get("weatherbotyes2re", {}).get("armed", {})
+        print(f"\n--- Currently Armed in State Blob ({len(armed)}) ---")
+        for k, v in armed.items():
+            print(f"  {k:35s}: taf_bucket={v.get('taf_bucket_id')} ref={v.get('ref_extreme')}")
+
 
 if __name__ == "__main__":
     main()
+
