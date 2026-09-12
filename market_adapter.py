@@ -39,6 +39,10 @@ def _fetch_json(url: str, timeout_seconds: float = 5.0) -> dict[str, Any]:
         raise RuntimeError(f"Gamma HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Gamma network: {exc.reason}") from exc
+    except TimeoutError as exc:
+        # 裸 socket 读超时不会被包成 URLError（2026-09-12 实测）。归一成 RuntimeError，
+        # 使 fetch_market_resolution 按 unresolved 返回 None，不再中止整轮结算。
+        raise RuntimeError(f"Gamma timeout: {exc}") from exc
     parsed = json.loads(payload)
     if not isinstance(parsed, dict):
         raise RuntimeError("Gamma event shape invalid")

@@ -1,5 +1,60 @@
 # Changelog — weatherbotyes2re
 
+## 2026-09-12 — 修 settle_failed 根因：裸 socket 读超时中断整轮结算（操作者选 A）
+
+- **现象（实测）**：healer 报告 CRIT 新增 `settle_failed`（1800s 内 1 次）；事件库 189,623 行中 `settle_failed` 共 4 次，最近一次 `02:11:46Z TimeoutError: The read operation timed out`。
+- **根因链**：`market_adapter._fetch_json` 只把 `HTTPError`/`URLError` 归一成 `RuntimeError`，**未处理裸 `TimeoutError`**（socket 读超时不包成 `URLError`）→ 异常穿透 `fetch_market_resolution` 的 `except (RuntimeError, ValueError, JSONDecodeError)`（实测 `issubclass(TimeoutError, OSError)` 为真、不在捕获列表）→ `_r_cycle` 记 `settle_failed` 并**中止整轮结算**（其余已可结算腿顺延到下轮）。
+- **修复（A）**：`_fetch_json` 增 `except TimeoutError: raise RuntimeError(f"Gamma timeout: ...")` ⇒ 超时按 unresolved 返回 `None`，由 `settle_poll_seconds=60` 下轮重试，不再中断整轮、不再产生 `settle_failed` CRIT。
+- **未采纳（备选，操作者可选）**：(B) 在 `fetch_market_resolution` 的 except 里加 `OSError`（同效）；(C) `settle_markets` 逐腿 `try/except OSError` + 记 `settle_leg_failed`（额外修掉"一腿超时拖累整轮"，但会保留一条告警）。若日后需要逐腿隔离，再补 (C)。
+- **验证**：新增 `tests_market_adapter.py`（4/4：超时→RuntimeError、`socket.timeout` 别名、resolution 超时返回 None 不中断、404 行为不变）；既有套件全绿（`tests_reversal`/`tests_fill_gate`/`tests_sleeve_*`/`tests_port` 28/28/`tests_live` 51/51）。
+- **同步**：同一缺陷存在于 PreYes 实盘仓（`market_adapter.py` md5 相同）—— 同一补丁已同步应用并部署。
+
+## 2026-09-11 — Phase 3c2: LIVE take 规则（腿级独立许可，**绝不降级被动**）
+
+- **操作者指令（原文，2026-09-11）**：*"允许像 paper 一样吃单，'仅当 YES 在 (0.48,0.90] 时才吃单'，YES 上限和其它暂时不调整"*。
+- **操作者纠偏（原文，2026-09-12）**：*"停止 'NO 腿永远被动(maker)' 的方向，改为腿级独立许可 + 绝不降级被动"*。
+- **背景**：paper 的成交是**吃单**（`re_execution.paper_match_fak` 沿卖盘走）；live 之前把每个 `send_fak`
+  梯子意图都下成 `post_only` 被动单（提交前夹价到 `best_ask − tick`），按构造**永不穿价** →
+  实测 24h live 6 次 fire **全 0 成交**（NO 腿 100% `no_book`，YES 腿多为 `abort_above_cap`），
+  而 paper 同期有 1 次 `send_fak` 成交（lucknow YES 16.67 股 @0.83）。
+  但**"带外退回被动挂单"是致命方向**：YES 卖价 0.40 属诱多假突破，被动单会在买一 0.38 接盘，
+  成交即 100% 买入必死桶（2026-09-11 多伦多该桶归零至 0.001、华沙跌 69%）。规则因此是**腿级 + take-or-nothing**。
+- `live/port.py`：新增**逐腿**判定 —— 新纯函数 `yes_price_band()` / `in_yes_band()` / `is_yes_leg()` /
+  `best_ask_of()` / `taker_cap_number()` / `yes_leg_price()`；`LivePort.fill_mode()` 对**该腿**给出
+  `taker`（FAK）或 `skip`（**不提交任何订单**），**live 成交通道上没有 maker**：
+  - **YES 腿**：仅当**自身价格** ∈ `(yes_min_ask, yes_max_ask]`（**半开：0.48 不含、0.90 含**；
+    lo/hi 只读取自两实例共用的 `config/yes2re_reversal.json`，缺省 0.48/0.90）时 FAK；**带外一律弃单**。
+  - **NO 腿**：受自身上限 `no_max_ask` 与盘口深度保护 —— **有卖单时 FAK 吃单，无卖单时 `no_book` 跳过**。
+  - fail-closed ⇒ **拒单**：cap 缺失/非法（非 `0 < cap ≤ 1`）、带值非法（整条 fire 停）、取不到 YES 价格、
+    限价 `≤ 0` / `> cap` / `> 1`。`match()` 在这些情形返回 `order_mode=skip` 且**不产生任何 client 调用**。
+  - YES 价格证据链（记入审计 `yes_price_source`）：`match()` 收到的 YES 腿梯子意图 `best_ask`（自身价格）
+    → `fire["ladder"]` YES 行 → `fire["yes_ask"/"yes_price"/"yes_best_ask"]` → **每 fire 一次**只读重取
+    （`transport.refetch_book`，记忆后供后续梯子复用）→ 都没有 ⇒ 拒单。`preflight` 在闸门拒绝时**清掉 client**。
+- `live/v2_transport.py::execute_leg`：`taker=True` ⇒ `post_only=False`（强制）、**不做下压夹价**、
+  `OrderType.FAK`（未成交余量服务端作废、**不留挂单、不报 `residual_risk`**）；纵深防御：显式
+  `0 < cap ≤ 1` **必需**（缺失/非法 ⇒ 拒 `taker_cap_required`）、限价必须 `(0, 1]`（否则拒
+  `price_out_of_range`）且 `≤ cap`（否则拒 `above_cap`）、必须 tick 对齐（否则拒 `price_not_on_tick`）；
+  `OrderType.FAK` 缺失的 SDK 构型**拒绝下单**而**绝不退化成可挂的 GTC**。`taker=False` 分支保持
+  逐字不变，但**只服务 `live/smoke.py` 诊断**，引擎成交通道永不使用它。三重闸门 / `risk_gate` /
+  `check_limits` / 最小权限哨兵 / tick 对齐全部不变，`post_order` 仍**全包唯一调用点**。
+- 审计（`data/live_events.jsonl`）：**不再**每次 `match` 追加 `action=fill_mode` 行（消除审计噪音、避免
+  污染 `submit.py --summary` 的计数）；`order_mode`（`taker`|`skip`）/ `taker_gate`（`yes_band`|`no_leg_ask`）/
+  `yes_price` / `yes_price_source` 随**已有**的 `intent`/`submit` 记录（`params.*`）落库。
+- 文档：`live/README.md` "LIVE take 规则"小节整节重写（两种腿各自的许可、绝不被动、fail-closed、
+  证据链、边界表、`no_max_ask` 实配 1.0 与 `AGENTS.md` 0.65 的不一致提示、以及"无 YES 腿的 fire 不存在"
+  的事实纠正）＋ 已知限制第 4/6/7 条 ＋ 阶段梯子新增 Phase 3c2 行；`ops/PENDING.md` T-6 据实重写
+  （含纠偏原文、腿级规则、为什么不被动、`no_max_ask` 不一致待决策）。
+- 测试：`tests_port.py` **28/28**（新增/改写：YES 带矩阵、**腿级独立许可**、**任何情况都无被动回退**、
+  cap 必需且 `0<cap≤1`、绝对价格边界、证据链、FAK 构造、部分/零成交记账、闸门不可绕过、限额不变、
+  **纯决策不落审计行且 `--summary` 计数不受影响**、引擎 fire 路径腿级一致）；`tests_live.py` **51/51**
+  （transport 级：FAK/post_only=False/不下压 + cap 必需 + 价格边界 + FAK 缺失即拒）；`tests_reversal.py`
+  计数不变。**paper 回归零差异**：`git worktree add --detach /tmp/fix_base 1c5373c` 取改动前代码，
+  `tests_reversal.py` / `tests_fill_gate.py` / `tests_sleeve_signal.py` / `tests_sleeve_wiring.py` /
+  `paper_reversal_sim.py --scenarios-only` 输出**逐行 diff 为空**；策略/引擎文件字节不变。
+- **未提交任何真实订单**（全程 stub/mock，审计路径重定向到临时文件；未跑 `live/smoke.py --enable-submit`）；
+  **未 commit / 未 push**。
+
+
 ## 2026-09-11 — 运维文档（ops/PENDING.md 待办单一清单）+ LIVE 真实验收记录
 
 - 新增 **`ops/PENDING.md`**：双实例全貌（paper / LIVE）、**4 个待决策项**（LIVE 闸门开启 / config 600 vs 账本 500 / `miami no_book` 永久锁是否重试 / LIVE 结算 claim 未实现）、**5 个 LIVE 技术待办**（账本初始资金对齐真实余额 / my155 WS down / 撤单后列表延迟 / 真实订单运维流程含事故复盘 / 资金规模）、paper 历史遗留、环境变量对照表、安全红线。
